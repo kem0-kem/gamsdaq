@@ -1,0 +1,156 @@
+name: Build and Deploy Gamsdaq to Azure Container Apps
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      environmentName:
+        description: 'Target environment (dev, staging, prod)'
+        required: false
+        default: 'prod'
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  DOTNET_VERSION: '10.0.x'
+  NODE_VERSION: '22'
+  AZURE_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP || 'rg-gamsdaq-prod' }}
+  AZURE_LOCATION: ${{ vars.AZURE_LOCATION || 'koreacentral' }}
+  ENVIRONMENT_NAME: ${{ inputs.environmentName || 'prod' }}
+  APP_NAME: 'gamsdaq'
+
+jobs:
+  build-and-test:
+    name: Build & Verify (.NET 10 + Vite TypeScript Web)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: src/gamsdaq-web/package-lock.json
+
+      - name: Install and build Vite TypeScript Web frontend
+        working-directory: src/gamsdaq-web
+        run: |
+          npm ci
+          npm run build
+
+      - name: Setup .NET 10 SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+          dotnet-quality: 'ga'
+
+      - name: Restore, build, and test .NET solution
+        run: |
+          dotnet restore Gamsdaq.sln
+          dotnet build Gamsdaq.sln --configuration Release --no-restore
+          dotnet test Gamsdaq.sln --configuration Release --no-build --verbosity normal
+
+  deploy:
+    name: Provision Bicep & Deploy Container App
+    needs: build-and-test
+    if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environmentName || 'prod' }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Ensure Resource Group exists
+        run: |
+          az group create \
+            --name "${{ env.AZURE_RESOURCE_GROUP }}" \
+            --location "${{ env.AZURE_LOCATION }}"
+
+      - name: Validate and Provision Bicep Infrastructure (ACR + ACA Env + App Insights)
+        id: infra
+        run: |
+          az bicep build --file infra/main.bicep
+          OUTPUTS=$(az deployment group create \
+            --resource-group "${{ env.AZURE_RESOURCE_GROUP }}" \
+            --template-file infra/main.bicep \
+            --parameters \
+              location="${{ env.AZURE_LOCATION }}" \
+              environmentName="${{ env.ENVIRONMENT_NAME }}" \
+              appName="${{ env.APP_NAME }}" \
+              deployContainerApp=false \
+            --query "properties.outputs" \
+            --output json)
+
+          ACR_LOGIN_SERVER=$(echo "$OUTPUTS" | jq -r '.acrLoginServer.value')
+          CONTAINER_APP_NAME=$(echo "$OUTPUTS" | jq -r '.containerAppName.value')
+          APP_INSIGHTS_NAME=$(echo "$OUTPUTS" | jq -r '.appInsightsName.value')
+
+          echo "acr_login_server=$ACR_LOGIN_SERVER" >> "$GITHUB_OUTPUT"
+          echo "container_app_name=$CONTAINER_APP_NAME" >> "$GITHUB_OUTPUT"
+          echo "app_insights_name=$APP_INSIGHTS_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Build and Push Image to Azure Container Registry
+        id: docker
+        run: |
+          ACR_SERVER="${{ steps.infra.outputs.acr_login_server }}"
+          ACR_NAME="${ACR_SERVER%%.*}"
+          IMAGE_TAG="${ACR_SERVER}/${{ env.APP_NAME }}:${{ github.sha }}"
+          LATEST_TAG="${ACR_SERVER}/${{ env.APP_NAME }}:latest"
+
+          az acr build --registry "$ACR_NAME" --image "${{ env.APP_NAME }}:${{ github.sha }}" --image "${{ env.APP_NAME }}:latest" .
+          echo "image_tag=$IMAGE_TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy Container Image to Azure Container Apps
+        id: aca-deploy
+        env:
+          COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
+        run: |
+          OUTPUTS=$(az deployment group create \
+            --resource-group "${{ env.AZURE_RESOURCE_GROUP }}" \
+            --template-file infra/main.bicep \
+            --parameters \
+              location="${{ env.AZURE_LOCATION }}" \
+              environmentName="${{ env.ENVIRONMENT_NAME }}" \
+              appName="${{ env.APP_NAME }}" \
+              deployContainerApp=true \
+              containerImage="${{ steps.docker.outputs.image_tag }}" \
+              githubToken="$COPILOT_GITHUB_TOKEN" \
+            --query "properties.outputs" \
+            --output json)
+
+          APP_URL=$(echo "$OUTPUTS" | jq -r '.appUrl.value')
+          echo "app_url=$APP_URL" >> "$GITHUB_OUTPUT"
+
+      - name: Post-Deploy Smoke Test (GET /api/health, GET /api/tickers, POST /api/agents/verify-stream)
+        run: |
+          APP_URL="${{ steps.aca-deploy.outputs.app_url }}"
+          echo "Deployed Gamsdaq URL: $APP_URL"
+          for i in {1..10}; do
+            if curl -fsS "$APP_URL/api/health" && \
+               curl -fsS "$APP_URL/api/tickers" && \
+               curl -fsS -X POST "$APP_URL/api/agents/verify-stream" -H "Content-Type: application/json" -d '{"query":"청도 명품 반시 대과 5kg 20박스","role":"SELLER","tickerCode":"CD-BANSI-13B-5KG"}' | grep -q "AUDIT_PASSED"; then
+              echo "Smoke test passed for /api/health, /api/tickers, and /api/agents/verify-stream!"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "Smoke test failed after retries"
+          exit 1

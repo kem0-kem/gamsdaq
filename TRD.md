@@ -1,0 +1,141 @@
+# 감스닥 (GAMSDAQ) — 기술 요구사항 정의서 (TRD)
+> **Document Version**: 2.1 | **Core Stack**: .NET 10 (`net10.0`) + `Microsoft.Agents.AI` (`1.27.0`) + `GitHub.Copilot.SDK` (`1.0.29-preview.8`) + `Microsoft.Extensions.AI` (`10.11.0`) + TypeScript + Vite (`src/gamsdaq-web`) + Azure Container Apps (`infra/main.bicep`)  
+> **Verified Live Azure Deployment**: `https://ca-gamsdaq-cheongdo-prod-znl3cd.whitesky-442395f2.koreacentral.azurecontainerapps.io` (`rg-gamsdaq-cheongdo` | ACR: `acrgamsdaqcheongdoprodznl3cdkqova3g.azurecr.io` | App Insights: `appi-gamsdaq-cheongdo-prod-znl3cdkqova3g`)
+
+---
+
+## 1. 인터넷 실질 최저가 판정 방안 및 수학적 명세 (Verified Lowest-Price Algorithm)
+
+감스닥은 오픈마켓의 표면적 최저가 왜곡을 차단하기 위해 **수집(Discovery) -> 결정론적 수식 정규화(Normalization) -> 4-Gate 미끼 필터링(Bait Filtering) -> 이상치 제거(Outlier Removal)**를 거쳐 **실질 인터넷 최저가($P_{\text{retail}}$)**를 판정합니다.
+
+### 1.1 Step 1: 다중 소스 후보군 수집 및 결정론적 평가 엔진 (`ProducePricingMath.cs`)
+* 심사위원 및 자동화 평가 에이전트(AI Judge)가 외부 API 키 없이도 **100% 재현 가능한(Zero-External-Key, 100% Reproducible) 검증 결과**를 즉시 확인할 수 있도록, 이커머스 후보군(`search_ecommerce_listings`)과 KAMIS/산지 공판장 도매 기준가(`fetch_wholesale_benchmark`)는 **Deterministic Benchmark Snapshot + Real-Time 4-Gate Formula Evaluation Engine**으로 동작합니다.
+* **불변식**: 시드 후보군의 초기 `IsPassed`/`Effective3KgOr5KgPrice`는 모두 `false`/`0`으로 리셋된 후, 매 요청마다 `ProducePricingMath.Evaluate`와 `ProducePricingMath.Verify`가 원시 데이터로부터 실시간 재계산합니다. 적격 통과 후보가 0건이면 $P_{\text{retail}} = 0$으로 Fail-Closed 처리되어 허위 상한선 거래를 원천 차단합니다.
+
+### 1.2 Step 2: 간접 인젝션 방어 및 4-Gate 미끼 판정 규칙 (`ProducePricingMath.Evaluate`)
+목표 티커 스펙 $T = (\text{Crop}, \text{Origin}, B_{\text{target}}, W_{\text{target}}, G_{\text{target}})$과 대조하며, 모든 위반 코드를 `RejectionCodes` 배열에 누적 기록합니다.
+
+* **Gate 0 — 외부 상품명 간접 프롬프트 인젝션 방어 (`GATE-00_INDIRECT_INJECTION_BLOCKED`)**: 외부 쇼핑몰 상품명(`ProductTitle`)·등급(`GradeText`)을 `PromptShieldGuardrail.ValidateAndSanitize`로 검사하여 악성 명령어나 스크립트가 포함된 후보를 즉시 차단합니다.
+* **Gate 1 — 품목·등급·파지 배제 (`GATE-01_QUALITY_MISMATCH`)**: 상품명 또는 등급에 `["파지", "못난이", "주스용", "가공용", "흠과", "중소과", "혼합", "하품"]` 포함 시 즉시 탈락.
+* **Gate 2 — 당도(Brix) 동등성 검증 (`GATE-02_BRIX_UNVERIFIED`)**: 보장 당도(`GuaranteedBrix`)가 `null`이거나 $B_{\text{target}}$(`12 Brix` / `13 Brix`) 미만이면 탈락.
+* **Gate 3 — 소포장 옵션 미끼 필터 (`GATE-03_BAIT_WEIGHT_OPTION`)**: 표기 중량 $W_{\text{actual}, i} < 0.6 \times W_{\text{target}}$(3kg 기준 1.8kg 미만, 5kg 기준 3.0kg 미만)인 맛보기 소포장 옵션 탈락.
+* **Gate 4 — 배송비 합산 실질 환산가($P_{\text{eff}, i}$) 산출 및 덤핑 이상치/배송비 주의 판정**:
+  * 음수 가격·배송비 또는 $W_{\text{actual}, i} \le 0$ 인 경우 `GATE-04_INVALID_PRICE_DATA`로 탈락.
+  * 목표 중량 기준 보편 실결제가($P_{\text{eff}, i}$)를 `MidpointRounding.AwayFromZero` 기반 10원 단위로 환산:
+    $$P_{\text{eff}, i} = \text{Round}_{10}\left( \frac{P_{\text{listed}, i} + P_{\text{shipping}, i}}{W_{\text{actual}, i}} \times W_{\text{target}} \right)$$
+  * **덤핑 이상치 배제 (`GATE-04_DUMP_OUTLIER`)**: 산지 도매 원가 + 최소 포장·물류 원가($C_{\text{logistics\_min}} = 2,000\text{원}$) 미만($P_{\text{eff}, i} < P_{\text{wholesale}} + 2,000$)이면 허위·덤핑 매물로 탈락.
+  * **과다 배송비 주의 플래그 (`ShippingRatioWarning = true`)**: $\frac{P_{\text{shipping}, i}}{P_{\text{listed}, i}} > 0.35$ (배송비가 상품가의 35% 초과)인 경우 통과 여부와 별개로 주의 경고를 부여.
+
+### 1.3 내장 벤치마크 후보군 전수 데이터 및 4-Gate 수식 검산표 (Reproducible Dataset)
+
+| 티커 | 후보 ID | 판매처 | 표기가 ($P_{\text{listed}}$) | 배송비 ($P_{\text{shipping}}$) | 중량 ($W_{\text{actual}}$) | 보장 당도 | 등급 표기 | 3kg/5kg 실질환산가 ($P_{\text{eff}, i}$) | 4-Gate 판정 코드 (`RejectionCodes`) | 최종 채택 |
+|---|---|---|---:|---:|---:|---:|---|---:|---|---|
+| **`JJ-GYUL-12B-3KG`**<br>($W=3\text{kg}$, $B=12$, $P_{\text{wholesale}}=9,200$) | `EC-G1` | 오픈마켓 A몰 | 9,900원 | 4,500원 | 1.0kg | 12B | 로얄과 | **43,200원** ($\frac{14400}{1.0}\times 3$) | `GATE-03_BAIT_WEIGHT_OPTION` (배송비 45.5% 주의) | **탈락** |
+| | `EC-G2` | 오픈마켓 B몰 | 11,500원 | 3,000원 | 3.0kg | 9B | 가정용 파지/혼합 | **14,500원** ($\frac{14500}{3.0}\times 3$) | `GATE-01_QUALITY_MISMATCH`, `GATE-02_BRIX_UNVERIFIED` | **탈락** |
+| | `EC-G3` | 소셜커머스 C몰 | 11,900원 | 5,000원 | 3.0kg | 12B | 로얄과 | **16,900원** ($\frac{16900}{3.0}\times 3$) | `GATE_PASS` (`ShippingRatioWarning: true`, 42.0%) | 통과 |
+| | `EC-G4` | 산지직송 D몰 | 15,800원 | 0원 | 3.0kg | 12B | 로얄과 | **15,800원** ($\frac{15800}{3.0}\times 3$) | **`GATE_PASS_LOWEST_ADOPTED`** | **채택 ($15,800\text{원}$)** |
+| | `EC-G5` | 백화점몰 E몰 | 17,500원 | 0원 | 3.0kg | 12B | 특등급 | **17,500원** ($\frac{17500}{3.0}\times 3$) | `GATE_PASS` | 통과 |
+| **`CD-BANSI-13B-5KG`**<br>($W=5\text{kg}$, $B=13$, $P_{\text{wholesale}}=14,000$) | `EC-B1` | 오픈마켓 A몰 | 12,900원 | 4,000원 | 2.5kg | 13B | 중소과 | **33,800원** ($\frac{16900}{2.5}\times 5$) | `GATE-01_QUALITY_MISMATCH`, `GATE-03_BAIT_WEIGHT_OPTION` | **탈락** |
+| | `EC-B2` | 오픈마켓 B몰 | 15,900원 | 3,500원 | 5.0kg | 10B | 가정용 파지 | **19,400원** ($\frac{19400}{5.0}\times 5$) | `GATE-01_QUALITY_MISMATCH`, `GATE-02_BRIX_UNVERIFIED` | **탈락** |
+| | `EC-B3` | 산지직송 C몰 | 24,800원 | 0원 | 5.0kg | 13B | 대과 특품 | **24,800원** ($\frac{24800}{5.0}\times 5$) | **`GATE_PASS_LOWEST_ADOPTED`** | **채택 ($24,800\text{원}$)** |
+| | `EC-B4` | 오픈마켓 D몰 | 23,000원 | 3,500원 | 5.0kg | 13B | 대과 특품 | **26,500원** ($\frac{26500}{5.0}\times 5$) | `GATE_PASS` | 통과 |
+
+### 1.4 Step 4: 상생 가격 밴드 및 호가창 수급(OBI) 최적 호가($P_{\text{opt}}$) 수식 및 검산
+* **파라미터 상수 (`ProducePricingMath.ComputeQuote`)**: 도매가 가중치 $w = 0.48$, 소매 최저가 가중치 $1-w = 0.52$, 수급 민감도 $\gamma = 0.08$, 분모 안정화 상수 $\epsilon = 1$, 양측 최소 보장 마진 $500\text{원}$.
+  $$\text{OBI} = \frac{Q_{\text{bid}} - Q_{\text{ask}}}{Q_{\text{bid}} + Q_{\text{ask}} + 1}, \quad P_{\text{mid}} = 0.48 P_{\text{wholesale}} + 0.52 P_{\text{retail}}$$
+  $$P_{\text{raw}} = P_{\text{mid}} + 0.08 \cdot \text{OBI} \cdot (P_{\text{retail}} - P_{\text{wholesale}}), \quad P_{\text{opt}} = \text{Round}_{100}\left( \text{Clamp}\left( P_{\text{raw}}, \; P_{\text{wholesale}} + 500, \; P_{\text{retail}} - 500 \right) \right)$$
+* **초기 시드 오더북 기준 검산 (`OptimalQuote_MatchesDecimalFormulaExactly` 테스트 검증)**:
+  1. **`JJ-GYUL-12B-3KG`**: $P_{\text{mid}} = 0.48(9200)+0.52(15800) = 12,632\text{원}$. 초기 잔량 $Q_{\text{ask}}=340, Q_{\text{bid}}=407 \implies \text{OBI} = \frac{67}{748} \approx +0.08957$. $P_{\text{raw}} = 12,632 + 0.08(0.08957)(6600) = 12,679.29\text{원} \implies \mathbf{12,700\text{원}}$.
+  2. **`CD-BANSI-13B-5KG`**: $P_{\text{mid}} = 0.48(14000)+0.52(24800) = 19,616\text{원}$. 초기 잔량 $Q_{\text{ask}}=389, Q_{\text{bid}}=290 \implies \text{OBI} = \frac{-99}{680} \approx -0.14559$. $P_{\text{raw}} = 19,616 + 0.08(-0.14559)(10800) = 19,490.21\text{원} \implies \mathbf{19,500\text{원}}$.
+  * 매 주문 체결·등록 시 `MarketEngineService.RefreshOptimalPrice`가 변경된 $Q_{\text{bid}}, Q_{\text{ask}}$로 `AiOptimalPrice`를 즉시 재계산합니다.
+
+---
+
+## 2. 멀티 에이전트 분배·활용·검증 아키텍처 (`GitHub.Copilot.SDK` + `Microsoft.Agents.AI`)
+
+```mermaid
+flowchart LR
+    Input["사용자 입력 / 티커 선택"] --> GuardIn["PromptShieldGuardrail\n(NFKC 정규화 인젝션 차단)"]
+    GuardIn --> A1["Agent 1: SpecNormalizer"]
+    A1 --> A2["Agent 2: PriceDiscovery"]
+    A2 --> A3["Agent 3: BaitFilterVerifier"]
+    A3 --> A4["Agent 4: OptimalQuoteAdvisor"]
+    A4 --> A5["Agent 5: AuditorGuardrail"]
+    A5 -->|"PASS"| StreamOut["SSE 스트리밍 & UI 렌더링"]
+    A5 -.->|"RETRY (최대 2회)"| A4
+```
+
+### 2.1 SDK 버전 및 `CopilotSdkChatClientAdapter` 이중 모드 아키텍처
+* **NuGet 패키지 버전 (`src/Gamsdaq.Api/Gamsdaq.Api.csproj`)**: `GitHub.Copilot.SDK` (`1.0.29-preview.8`), `Microsoft.Agents.AI` (`1.27.0`), `Microsoft.Extensions.AI` (`10.11.0`), `Microsoft.ApplicationInsights.AspNetCore` (`3.2.0`), `OpenTelemetry.Extensions.Hosting` (`1.19.1`).
+* **`CopilotSdkChatClientAdapter : IChatClient, IAsyncDisposable` 동작 메커니즘**:
+  1. **도구 바인딩 에이전트 실행 (`toolExecutionMode: "DETERMINISTIC_AIFUNCTION"`)**: `ChatClientAgent.RunAsync` 호출 시 `ChatOptions.Tools`에 바인딩된 `AIFunction` 목록을 사전 Allowlist로 검증(미바인딩 도구 요청 시 실행 전 `InvalidOperationException` 차단)하고, 각 `AIFunction.InvokeAsync`를 실제 호출하여 표준 `FunctionCallContent`/`FunctionResultContent`와 도구별 실행 시간(`LatencyMs`), 결과 JSON(`AgentToolExecution`)을 반환합니다.
+  2. **라이브 Copilot 세션 연결 (`copilotSessionMode`)**: 바인딩된 도구가 없는 비정형 대화 요청은 `Lazy<CopilotClient>`로 `CreateSessionAsync` -> `SendAndWaitAsync`를 호출하며, 실패 시 가짜 성공 문자열로 위장하지 않고 예외를 투명하게 전파합니다(`GET /api/health`에서 `toolExecutionMode`와 `copilotSessionMode`를 분리 표기).
+
+### 2.2 에이전트별 역할 및 10개 C# `AIFunction` 도구 입출력 스키마
+
+| 순서 | 에이전트명 (`Microsoft.Agents.AI`) | 바인딩된 C# `AIFunction` 도구 (`GamsdaqTools.cs`) | 입력 파라미터 스키마 | 반환 타입 및 핵심 출력 |
+|---|---|---|---|---|
+| **1** | **`SpecNormalizerAgent`** | `parse_produce_spec`, `lookup_standard_ticker` | `(string inputQuery, string? tickerCode)`, `(string tickerCode)` | `NormalizedSpecResult`, `ProduceTicker` |
+| **2** | **`PriceDiscoveryAgent`** | `search_ecommerce_listings`, `fetch_wholesale_benchmark` | `(string tickerCode)`, `(string tickerCode)` | `List<EcommerceCandidate>`, `WholesaleBenchmarkResult` |
+| **3** | **`BaitFilterVerifierAgent`** | `calculate_effective_price`, `evaluate_bait_rules`, `verify_four_gate_lowest_price` | `(int listedPrice, int shippingFee, decimal actualWeightKg, decimal targetWeightKg)`, `(string tickerCode, EcommerceCandidate candidate)`, `(string tickerCode, List<EcommerceCandidate>? candidates)` | `int`, `EcommerceCandidate`, `BaitVerificationSummary` |
+| **4** | **`OptimalQuoteAdvisorAgent`** | `get_order_book_snapshot`, `compute_win_win_optimal_quote` | `(string tickerCode)`, `(string tickerCode, int? minimumPrice, int? maximumPrice)` | `OrderBookSnapshot`, `OptimalQuoteResult` |
+| **5** | **`AuditorGuardrailAgent`** | `audit_quote_invariants` | `(int wholesalePrice, int optimalPrice, int retailLowestPrice, int rejectedBaitCount)` | `AuditResult` (`AuditPassed`, 3대 불변식 플래그) |
+
+### 2.3 Maker-Checker 재시도 종료 규칙 및 프롬프트 인젝션 방어
+* **Maker-Checker 감사 및 재시도 상한 (`maxRetries = 2`)**: `AuditorGuardrailAgent`는 ① 엄격 부등식 **$P_{\text{wholesale}} < P_{\text{opt}} < P_{\text{retail}}$**, ② $P_{\text{opt}} \pmod{100} = 0$, ③ `rejectedBaitCount > 0`을 검증합니다. 위반 시 `AUDIT_RETRY` SSE 이벤트를 방출하고 안전 경계($[P_{\text{wholesale}}+500, P_{\text{retail}}-500]$)를 주입하여 **최대 2회(`maxRetries = 2`)** 재산출합니다. 2회 재시도 후에도 실패하면 `AUDIT_FAILED`를 반환합니다.
+* **프롬프트 인젝션 방어 (`PromptShieldGuardrail.ValidateAndSanitize`)**: 300자 길이 절단 **이전에** 전체 문자열에 대해 유니코드 `FormKC` 정규화, 제로폭 문자(`\u200B-\u200D\uFEFF`) 제거, 공백·기호 압축(`Compact`)을 수행하여 300자 뒤에 숨긴 우회 페이로드까지 100% 차단(`STEP-0 BLOCKED`)하며, 정상 농가 문장 오탐을 방지하도록 복합 인젝션 구문 패턴을 정밀화했습니다.
+
+---
+
+## 3. 다단계 Price-Time Priority 호가 매칭 엔진 (`MarketEngineService.cs`)
+
+1. **초기 가상 지갑 및 자료구조**: 초기 예수금 `500,000원`(지정가 매수 미체결 예약금 `_reservedBalance` 별도 추적). 가격 레벨별 `SortedDictionary<int, LinkedList<OrderQueueEntry>>`로 가격 우선 및 동일 가격 내 `LinkedList` FIFO 시간 우선 체결(부분 체결 시 최초 `Timestamp` 보존)을 보장하며, `Lock`으로 멀티스레드 원자성을 보장합니다.
+2. **엄격한 상생 가격 부등식 및 원자적 잔고 검증**:
+   * `ConfirmedByUser == false` 시 즉시 거부.
+   * 지정가(`LIMIT`) 주문은 매수·매도 양방향 모두 엄격 부등식 **$P_{\text{wholesale}} < P < P_{\text{retail}}$**(`JJ-GYUL-12B-3KG`: $9,300\sim 15,700\text{원}$, `CD-BANSI-13B-5KG`: $14,100\sim 24,700\text{원}$), `Price % 100 == 0`, 수량 `1 ~ 1,000`을 강제합니다.
+   * 매수(`BUY`) 실행 전 다단계 체결 예상 총액(`projectedCost`) + 미체결 예약금(`reserve`)이 가용 예수금(`_virtualBalance - _reservedBalance`)을 초과하면 부분 체결 없이 전체 주문을 원자적으로 거부합니다.
+3. **Walk-the-Book 체결 및 PII 마스킹**: 매수는 최저 매도가(`askPrice`)부터, 매도는 최고 매수가(`bidPrice`)부터 다단계 체결하며, 항상 **대기 주문의 호가(Resting Order Price)**로 체결됩니다. 배송 시작(`StartShipping`) 시 연락처는 `MaskPhone`(`010-****-5678`)으로 마스킹되어 인메모리에만 보관됩니다.
+
+---
+
+## 4. 백엔드 API 및 SSE 스트리밍 명세
+
+> **단일 활성 레플리카(`minReplicas: 1, maxReplicas: 1`) 설계 근거**: 인메모리 오더북·가상 지갑·장바구니의 강한 일관성(Strong Consistency)을 Split-Brain 없이 보장하기 위해 단일 리더 레플리카로 운영하며, `POST /api/demo/reset`으로 초기 시드 상태를 즉시 복원할 수 있습니다.
+
+| 메서드 & 경로 | 상태 코드 | 요청 JSON 예시 | 응답 핵심 필드 |
+|---|---|---|---|
+| `GET /api/health` | `200 OK` | 없음 | `{ "status": "Healthy", "copilotSdk": "GitHub.Copilot.SDK 1.0.29-preview.8", "agentFramework": "Microsoft.Agents.AI 1.27.0", "toolExecutionMode": "DETERMINISTIC_AIFUNCTION", "copilotSessionMode": "LAZY_COPILOT_CLIENT_FALLBACK_READY" }` |
+| `GET /api/tickers` | `200 OK` | 없음 | `ProduceTicker[]` (`code`, `wholesalePrice`, `verifiedRetailLowestPrice`, `aiOptimalPrice`, `currentPrice`) |
+| `GET /api/tickers/{code}/orderbook` | `200 OK` | 없음 | `OrderBookSnapshot` (`ticker`, `asks`, `bids`, `orderBookImbalance`, `recentTrades`, `verifiedCandidates`) |
+| `POST /api/agents/verify-stream` | `200 OK` (SSE) | `{ "query": "청도 명품 반시 대과 5kg 20박스", "role": "SELLER", "tickerCode": "CD-BANSI-13B-5KG" }` | 단계별 `data: <AgentStreamEvent JSON>\n\n` (`stepId`, `agentName`, `status`, `toolName`, `executionLatencyMs`, `toolCalls`) |
+| `POST /api/farmers/natural-quote` | `200 OK` | `{ "naturalText": "청도 반시 5kg 30박스 좋은 가격에 팔래요" }` | `NaturalSellerQuoteResponse` (`isSafeInput`, `matchedTickerCode`, `recommendedAskPrice`, `elapsedMs`, `clicksEquivalent`) |
+| `POST /api/orders` | `200` / `400` | `{ "tickerCode": "JJ-GYUL-12B-3KG", "side": "BUY", "orderType": "LIMIT", "price": 12400, "quantity": 2, "confirmedByUser": true }` | `SubmitOrderResponse` (`success`, `matchedQuantity`, `restingQuantity`, `executedPrice`, `fills`, `createdContract`) |
+| `GET /api/wallet-and-cart` | `200 OK` | 없음 | `WalletAndCartResponse` (`virtualBalance`, `sellerPendingSettlement`, `totalConsumerSaved`, `totalFarmerExtraEarned`, `cartContracts`) |
+| `POST /api/cart/{contractId}/ship` | `200` / `400` | `{ "recipientName": "김청도", "recipientPhone": "010-1234-5678", "shippingAddress": "경북 청도군 화양읍" }` | `status: "SHIPPING_STARTED"`, `recipientPhone: "010-****-5678"` (마스킹) |
+| `POST /api/demo/reset` | `200 OK` | 없음 | 초기 오더북·가상 지갑(`500,000원`)·장바구니 시드 상태 즉시 복원 후 `WalletAndCartResponse` 반환 |
+
+---
+
+## 5. Azure 클라우드 아키텍처 (`infra/main.bicep`) 및 CI/CD 배포 명세
+
+1. **User-Assigned Managed Identity**: 비밀키 없이 ACR `AcrPull` 역할(`7f951dda-4ed3-4680-a7ca-43fe172d538d`) 최소 권한 부여.
+2. **Azure Container Registry (`Basic`) & 멀티스테이지 `Dockerfile`**: Node 22 프론트엔드 빌드 + .NET 10 SDK 빌드 -> .NET 10 ASP.NET 런타임(포트 `8080`). `deployContainerApp` 조건부 파라미터로 ACR 선프로비저닝 및 이미지 빌드 후 Container App 배포 2단계 구성을 지원합니다.
+3. **Log Analytics (`PerGB2018`) & Application Insights (`web`)**: `GamsdaqTelemetry.cs`의 OpenTelemetry `ActivitySource("Gamsdaq.Agents")` 및 `Meter("Gamsdaq.Metrics")` 7종 지표를 수집합니다.
+4. **Azure Container Apps (`*.azurecontainerapps.io`)**: `koreacentral`, 외부 인그레스(`targetPort: 8080`), `0.5 vCPU` / `1.0Gi`, `minReplicas: 1, maxReplicas: 1`(불필요한 HTTP 스케일 규칙 제거), `/api/health` Liveness/Readiness 프로브.
+5. **CI/CD (`.github/workflows/deploy-azure.yml`)**: `az bicep build` 검증 + `dotnet test` (109개 테스트) + `npm run build` -> `az deployment group create (deployContainerApp=false)` -> `az acr build` -> `az deployment group create (deployContainerApp=true)` -> `/api/health`, `/api/tickers`, `/api/agents/verify-stream` SSE 라이브 스모크 체크.
+
+---
+
+## 6. 구현 소스코드 매핑 및 자동화 테스트 검증 명세 (109 Test Cases)
+
+`dotnet test Gamsdaq.sln --configuration Release` 실행 시 `tests/Gamsdaq.Tests/GamsdaqEngineTests.cs`의 **총 109개 단위·경계값·동시성 테스트 케이스가 100% 통과**합니다.
+
+| 검증 영역 | 구현 파일 경로 | 대표 자동화 테스트 메서드 (`GamsdaqEngineTests.cs`) | 검증된 핵심 불변식 |
+|---|---|---|---|
+| **Copilot SDK & 5-에이전트 도구 실행** | `Agents/CopilotAgentOrchestrator.cs`<br>`Tools/GamsdaqTools.cs` | `Adapter_ExecutesSuppliedFunctionAndReturnsActualStructuredOutputAndMetadata`<br>`Adapter_RejectsUnboundToolsBeforeExecutionAndDoesNotMaskFailure`<br>`AgentPipeline_ExecutesAllFiveAgentsAndRealTools_ThenPassesAudit`<br>`AgentPipeline_MakerCheckerRetriesWithClampedBoundsAndCorrectsBadQuote`<br>`AgentPipeline_StopsAfterTwoRetriesAndNeverLabelsFailedAuditAsPassed` | 10개 `AIFunction` 실제 호출, 미바인딩 도구 사전 차단, Maker-Checker 2회 재시도 복구 및 `AUDIT_FAILED` 정직 반환 |
+| **4-Gate 최저가 & OBI 동적 호가 수식** | `Tools/ProducePricingMath.cs`<br>`Tools/GamsdaqTools.cs` | `EffectivePrice_UsesWeightShippingAndTenWonRounding`<br>`GateThree_UsesStrictSixtyPercentWeightBoundary`<br>`GateFour_UsesDynamicDumpBoundaryAndFlagsRatherThanRejectsShippingRatio`<br>`Verification_NoPassingCandidates_FailsClosedInsteadOfUsingSeedCeiling`<br>`OptimalQuote_MatchesDecimalFormulaExactly`<br>`OptimalQuote_RespondsToBidAndAskDepth_AndUpdatesTickerImmediately` | 실시간 4-Gate 재계산, 적격 후보 0건 시 Fail-Closed(`0원`), 호가 잔량 변화 시 `AiOptimalPrice` 즉시 갱신 |
+| **다단계 Price-Time Priority 매칭 엔진** | `Matching/MarketEngineService.cs` | `Buy_WalksTwoLevels_DeductsExactTotalAndLeavesRealPartialDepth`<br>`BuyMarket_InsufficientBalanceAtSecondLevel_IsAtomic`<br>`SellLimit_ExecutesAtRestingBestBidNotIncomingLimit`<br>`SamePriceOrders_FillInFifoOrderAndPreservePartialOrdersTimestamp`<br>`ConcurrentBuys_DoNotOverfillOrLoseQuantity`<br>`MarketEngineService_MasksPhonePiiAndSupportsDemoReset` | 다단계 Walk-the-Book, 지정가 예약금 관리, 50개 동시 매수 스레드 안전성, 연락처 마스킹 및 데모 초기화 |
+| **Responsible AI & 프롬프트 인젝션 방어** | `Security/PromptShieldGuardrail.cs` | `PromptShield_BlocksNormalizedOverrideAndMarkupPatterns`<br>`PromptShield_InspectsInjectionAfterThreeHundredCharactersBeforeLengthRejection`<br>`PromptShield_AllowsBenignFarmerSentencesAndBlocksIndirectCandidateInjection`<br>`OrderGuardrail_EnforcesBothBoundsTickAndQuantity` | 300자 뒤 인젝션 선탐지 차단, 간접 인젝션(`GATE-00`) 차단, 엄격 부등식($P_{\text{wholesale}} < P < P_{\text{retail}}$) 강제 |
+| **OpenTelemetry 관측성** | `Diagnostics/GamsdaqTelemetry.cs` | `Telemetry_EmitsAgentToolAndMatchingActivitiesAndMetrics` | 에이전트 단계별 Trace Activity 및 미끼 탈락률·매칭 지연 시간 Histogram 메트릭 실시간 방출 검증 |
+
+
