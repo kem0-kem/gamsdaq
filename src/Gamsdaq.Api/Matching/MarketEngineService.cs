@@ -103,7 +103,7 @@ public class MarketEngineService
         [
             new EcommerceCandidate(
                 "EC-G1", "오픈마켓 A몰 (네이버쇼핑)", "[특가] 제주 노지 감귤 달콤 과즙팡팡",
-                9_900, 4_500, 1.0m, 12, "로얄과",
+                9_900, 4_500, 1.0m, 12, "로얄과 특등급",
                 0, false, "UNVERIFIED", "",
                 "https://search.shopping.naver.com/search/all?query=%EC%A0%9C%EC%A3%BC+%EB%85%B8%EC%A7%80+%EA%B0%90%EA%B7%A4+1kg"
             ),
@@ -115,19 +115,19 @@ public class MarketEngineService
             ),
             new EcommerceCandidate(
                 "EC-G3", "소셜커머스 C몰 (G마켓)", "서귀포 고당도 12브릭스 노지감귤 3kg 로얄과",
-                11_900, 5_000, 3.0m, 12, "로얄과",
+                11_900, 5_000, 3.0m, 12, "로얄과 특등급",
                 0, false, "UNVERIFIED", "",
                 "https://www.gmarket.co.kr/n/search?keyword=12%EB%B8%8C%EB%A6%AD%EC%8A%A4+%EB%85%B8%EC%A7%80%EA%B0%90%EA%B7%A4+3kg"
             ),
             new EcommerceCandidate(
                 "EC-G4", "산지직송 D몰 (쿠팡 로켓프레시)", "[비파괴당도선별] 12브릭스 보장 제주 노지감귤 3kg 로얄과 무료배송",
-                15_800, 0, 3.0m, 12, "로얄과",
+                15_800, 0, 3.0m, 12, "로얄과 특등급",
                 0, false, "UNVERIFIED", "",
                 "https://www.coupang.com/np/search?q=12%EB%B8%8C%EB%A6%AD%EC%8A%A4+%EB%85%B8%EC%A7%80%EA%B0%90%EA%B7%A4+3kg"
             ),
             new EcommerceCandidate(
                 "EC-G5", "백화점몰 E몰 (SSG닷컴)", "제주 명품 12브릭스 노지 감귤 선물세트 3kg",
-                17_500, 0, 3.0m, 12, "특등급",
+                17_500, 0, 3.0m, 12, "로얄과 특등급",
                 0, false, "UNVERIFIED", "",
                 "https://www.ssg.com/search.ssg?query=12%EB%B8%8C%EB%A6%AD%EC%8A%A4+%EB%85%B8%EC%A7%80%EA%B0%90%EA%B7%A4+3kg"
             )

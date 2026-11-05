@@ -33,18 +33,28 @@ public sealed class CopilotSdkChatClientAdapter : IChatClient, IAsyncDisposable
     private readonly Lazy<CopilotClient> _copilotClient;
     private readonly Func<IReadOnlyList<ChatMessage>, IReadOnlyDictionary<string, AIFunction>, CancellationToken, Task<ToolInvocationPlan?>>? _modelToolPlanner;
     private readonly Func<string, CancellationToken, Task<string?>>? _copilotSynthesizer;
+    private readonly Func<SessionConfig, MessageOptions, CancellationToken, Task<string?>>? _sessionResponder;
     private int _disposed;
+    private string _lastToolExecutionMode = "NOT_EXECUTED";
 
     public string ConnectionStatus { get; private set; } = "RESILIENT_FALLBACK_DETERMINISTIC_AIFUNCTION";
+    public string LastToolExecutionMode => Volatile.Read(ref _lastToolExecutionMode);
+    public static IReadOnlyList<string> SupportedExecutionModes { get; } = Array.AsReadOnly(new[]
+    {
+        "NOT_EXECUTED", "DETERMINISTIC_AIFUNCTION", "COPILOT_SDK_SYNTHESIS_WITH_AIFUNCTION",
+        "COPILOT_SDK_MODEL_DIRECTED_AIFUNCTION", "COPILOT_SDK_NATIVE_AIFUNCTION"
+    });
 
     public CopilotSdkChatClientAdapter(
         ILogger<CopilotSdkChatClientAdapter> logger,
         Func<IReadOnlyList<ChatMessage>, IReadOnlyDictionary<string, AIFunction>, CancellationToken, Task<ToolInvocationPlan?>>? modelToolPlanner = null,
-        Func<string, CancellationToken, Task<string?>>? copilotSynthesizer = null)
+        Func<string, CancellationToken, Task<string?>>? copilotSynthesizer = null,
+        Func<SessionConfig, MessageOptions, CancellationToken, Task<string?>>? sessionResponder = null)
     {
         _logger = logger;
         _modelToolPlanner = modelToolPlanner;
         _copilotSynthesizer = copilotSynthesizer;
+        _sessionResponder = sessionResponder;
         _copilotClient = new Lazy<CopilotClient>(() => new CopilotClient(new CopilotClientOptions
         {
             GitHubToken = ResolveGitHubToken(),
@@ -66,10 +76,10 @@ public sealed class CopilotSdkChatClientAdapter : IChatClient, IAsyncDisposable
     public static SessionConfig BuildSessionConfig(
         string? systemInstructions,
         IReadOnlyDictionary<string, AIFunction> functions,
-        string model = "gpt-5") =>
+        string? model = null) =>
         new()
         {
-            Model = model,
+            Model = model ?? Environment.GetEnvironmentVariable("COPILOT_MODEL"),
             Tools = functions.Values.Cast<AIFunctionDeclaration>().ToList(),
             AvailableTools = functions.Keys.ToList(),
             OnPermissionRequest = PermissionHandler.ApproveAll,
@@ -92,6 +102,33 @@ public sealed class CopilotSdkChatClientAdapter : IChatClient, IAsyncDisposable
         };
 
     public ChatClientMetadata Metadata => new("GitHub.Copilot.SDK", null, "copilot-market-agent");
+
+    private async Task<string?> SendSessionAsync(string systemText, IReadOnlyDictionary<string, AIFunction> functions,
+        string prompt, string? upstreamAgent, TimeSpan timeout, CancellationToken cancellationToken)
+    {
+        var config = BuildSessionConfig(systemText, functions);
+        var message = BuildMessageOptions(prompt, upstreamAgent);
+        if (_sessionResponder is not null)
+            return await _sessionResponder(config, message, cancellationToken);
+        await using var session = await _copilotClient.Value.CreateSessionAsync(config, cancellationToken);
+        var reply = await session.SendAndWaitAsync(message, timeout, cancellationToken);
+        return reply?.Data?.Content;
+    }
+
+    private sealed class SessionAIFunction(AIFunction inner,
+        Func<AIFunctionArguments, CancellationToken, ValueTask<object?>> invoke) : DelegatingAIFunction(inner)
+    {
+        // SDK callbacks can arrive on RPC threads without the request's AsyncLocal workspace.
+        private readonly ExecutionContext? _context = ExecutionContext.Capture();
+
+        protected override ValueTask<object?> InvokeCoreAsync(AIFunctionArguments arguments, CancellationToken cancellationToken)
+        {
+            if (_context is null) return invoke(arguments, cancellationToken);
+            ValueTask<object?> result = default;
+            ExecutionContext.Run(_context.CreateCopy(), _ => result = invoke(arguments, cancellationToken), null);
+            return result;
+        }
+    }
 
     public async Task<ChatResponse> GetResponseAsync(
         IEnumerable<ChatMessage> messages,
@@ -121,57 +158,89 @@ public sealed class CopilotSdkChatClientAdapter : IChatClient, IAsyncDisposable
             return new ChatResponse(new ChatMessage(ChatRole.Assistant, reply.Data.Content));
         }
 
-        var (plan, modelSelectedTools, envelope) = await ResolveToolPlanAsync(history, systemText, userText, functions, cancellationToken);
-        if (plan.Calls.Count == 0) throw new InvalidOperationException("At least one bound tool invocation is required.");
-        // Validate the complete allowlist before executing even the first call.
-        foreach (var call in plan.Calls)
-        {
-            if (!functions.ContainsKey(call.ToolName))
-            {
-                throw new InvalidOperationException($"Tool '{call.ToolName}' is not bound to this agent.");
-            }
-        }
-
         var started = Stopwatch.GetTimestamp();
         var executions = new List<AgentToolExecution>();
         var responseMessages = new List<ChatMessage>();
+        var envelope = TryParseHandoffEnvelope(userText);
         var dynamicState = envelope?.State is not null
             ? new Dictionary<string, object?>(envelope.State, StringComparer.OrdinalIgnoreCase)
             : new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
+        using var toolGate = new SemaphoreSlim(1, 1);
+        var nativeInvocationKeys = new HashSet<string>(StringComparer.Ordinal);
+        bool nativeExecuted = false;
+        Exception? toolFailure = null;
+
+        static string InvocationKey(string name, Dictionary<string, object?> arguments) =>
+            name + ":" + JsonSerializer.Serialize(arguments.OrderBy(pair => pair.Key).ToDictionary(pair => pair.Key, pair => pair.Value), JsonOptions);
+
+        async ValueTask<object?> InvokeTrackedAsync(AIFunction function, AIFunctionArguments supplied, bool native, CancellationToken token)
+        {
+            using var linkedCancellation = CancellationTokenSource.CreateLinkedTokenSource(token, cancellationToken);
+            await toolGate.WaitAsync(linkedCancellation.Token);
+            try
+            {
+                using var activity = GamsdaqTelemetry.ActivitySource.StartActivity($"tool.{function.Name}");
+                activity?.SetTag("tool.name", function.Name);
+                activity?.SetTag("tool.native", native);
+                var callId = Guid.NewGuid().ToString("N");
+                var resolvedArgs = ResolveChainedArguments(new Dictionary<string, object?>(supplied), function, dynamicState);
+                var key = InvocationKey(function.Name, resolvedArgs);
+                var callStarted = Stopwatch.GetTimestamp();
+                object? result;
+                try
+                {
+                    result = await function.InvokeAsync(new AIFunctionArguments(resolvedArgs), linkedCancellation.Token);
+                }
+                catch (Exception exception)
+                {
+                    toolFailure = exception;
+                    activity?.SetStatus(ActivityStatusCode.Error, exception.Message);
+                    _logger.LogWarning("Tool {ToolName} failed with {ExceptionType}", function.Name, exception.GetType().Name);
+                    throw;
+                }
+                var output = JsonSerializer.SerializeToElement(result, JsonOptions);
+                MergeToolOutputIntoState(output, dynamicState);
+                executions.Add(new AgentToolExecution(callId, function.Name,
+                    Stopwatch.GetElapsedTime(callStarted).TotalMilliseconds, output));
+                responseMessages.Add(new ChatMessage(ChatRole.Assistant, [
+                    new FunctionCallContent(callId, function.Name, resolvedArgs)]));
+                responseMessages.Add(new ChatMessage(ChatRole.Tool, [new FunctionResultContent(callId, output)]));
+                if (native)
+                {
+                    nativeExecuted = true;
+                    nativeInvocationKeys.Add(key);
+                    Volatile.Write(ref _lastToolExecutionMode, "COPILOT_SDK_NATIVE_AIFUNCTION");
+                }
+                return result;
+            }
+            finally
+            {
+                toolGate.Release();
+            }
+        }
+
+        var sessionFunctions = functions.ToDictionary(pair => pair.Key,
+            pair => (AIFunction)new SessionAIFunction(pair.Value,
+                (arguments, token) => InvokeTrackedAsync(pair.Value, arguments, true, token)));
+        var (plan, modelSelectedTools, _) = await ResolveToolPlanAsync(history, systemText, userText, sessionFunctions, cancellationToken);
+        if (toolFailure is not null) System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(toolFailure).Throw();
+        if (plan.Calls.Count == 0) throw new InvalidOperationException("At least one bound tool invocation is required.");
+        // Validate the complete allowlist before executing the returned plan.
+        foreach (var call in plan.Calls)
+            if (!functions.ContainsKey(call.ToolName))
+                throw new InvalidOperationException($"Tool '{call.ToolName}' is not bound to this agent.");
 
         foreach (var call in plan.Calls)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            using var activity = GamsdaqTelemetry.ActivitySource.StartActivity($"tool.{call.ToolName}");
-            activity?.SetTag("tool.name", call.ToolName);
-            string callId = Guid.NewGuid().ToString("N");
             var resolvedArgs = ResolveChainedArguments(call.Arguments, functions[call.ToolName], dynamicState);
-            var arguments = new AIFunctionArguments(resolvedArgs);
-            var callStarted = Stopwatch.GetTimestamp();
-            object? result;
-            try
-            {
-                result = await functions[call.ToolName].InvokeAsync(arguments, cancellationToken);
-            }
-            catch (Exception exception)
-            {
-                activity?.SetStatus(ActivityStatusCode.Error, exception.Message);
-                _logger.LogWarning("Tool {ToolName} failed with {ExceptionType}", call.ToolName, exception.GetType().Name);
-                throw;
-            }
-            var output = JsonSerializer.SerializeToElement(result, JsonOptions);
-            MergeToolOutputIntoState(output, dynamicState);
-            var execution = new AgentToolExecution(callId, call.ToolName,
-                Stopwatch.GetElapsedTime(callStarted).TotalMilliseconds, output);
-            executions.Add(execution);
-            responseMessages.Add(new ChatMessage(ChatRole.Assistant, [
-                new FunctionCallContent(callId, call.ToolName, resolvedArgs)]));
-            responseMessages.Add(new ChatMessage(ChatRole.Tool, [new FunctionResultContent(callId, output)]));
+            if (nativeInvocationKeys.Remove(InvocationKey(call.ToolName, resolvedArgs))) continue;
+            await InvokeTrackedAsync(functions[call.ToolName], new AIFunctionArguments(resolvedArgs), false, cancellationToken);
         }
 
         var batchMode = modelSelectedTools ? "COPILOT_SDK_MODEL_DIRECTED_AIFUNCTION" : "DETERMINISTIC_AIFUNCTION";
         string? copilotReasoning = null;
-        if (_copilotSynthesizer is not null || ResolveGitHubToken() is not null)
+        if (_copilotSynthesizer is not null || _sessionResponder is not null || ResolveGitHubToken() is not null)
         {
             try
             {
@@ -183,13 +252,9 @@ public sealed class CopilotSdkChatClientAdapter : IChatClient, IAsyncDisposable
                 }
                 else
                 {
-                    await using var session = await _copilotClient.Value.CreateSessionAsync(
-                        BuildSessionConfig(systemText, functions), cancellationToken);
-                    var reply = await session.SendAndWaitAsync(
-                        BuildMessageOptions($"Summarize produce verification step concisely in Korean based on tool outputs: {toolSummary}", envelope?.UpstreamAgent ?? plan.UpstreamAgent),
-                        TimeSpan.FromSeconds(10),
-                        cancellationToken);
-                    summary = reply?.Data?.Content;
+                    summary = await SendSessionAsync(systemText, sessionFunctions,
+                        $"Summarize produce verification step concisely in Korean based on tool outputs: {toolSummary}",
+                        envelope?.UpstreamAgent ?? plan.UpstreamAgent, TimeSpan.FromSeconds(10), cancellationToken);
                 }
                 cancellationToken.ThrowIfCancellationRequested();
                 if (!string.IsNullOrWhiteSpace(summary))
@@ -208,6 +273,9 @@ public sealed class CopilotSdkChatClientAdapter : IChatClient, IAsyncDisposable
             }
         }
 
+        if (toolFailure is not null) System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(toolFailure).Throw();
+        if (nativeExecuted) batchMode = "COPILOT_SDK_NATIVE_AIFUNCTION";
+        Volatile.Write(ref _lastToolExecutionMode, batchMode);
         var batch = new AgentToolBatchResult(batchMode, Stopwatch.GetElapsedTime(started).TotalMilliseconds, executions, copilotReasoning);
         responseMessages.Add(new ChatMessage(ChatRole.Assistant, JsonSerializer.Serialize(batch, JsonOptions)));
         return new ChatResponse(responseMessages)
@@ -241,19 +309,17 @@ public sealed class CopilotSdkChatClientAdapter : IChatClient, IAsyncDisposable
                 return (planned, true, envelope);
             }
         }
-        else if (ResolveGitHubToken() is not null)
+        else if (_sessionResponder is not null || ResolveGitHubToken() is not null)
         {
             try
             {
-                await using var session = await _copilotClient.Value.CreateSessionAsync(
-                    BuildSessionConfig(systemText, functions), cancellationToken);
                 var toolSchemas = functions.Values.Select(f => new { f.Name, f.Description, Schema = f.JsonSchema });
                 var prompt = $"Select bound tools to invoke as JSON {{\"calls\":[{{\"toolName\":\"...\",\"arguments\":{{...}}}}]}}. Available tools: {JsonSerializer.Serialize(toolSchemas, JsonOptions)}. Input: {userText}";
-                var reply = await session.SendAndWaitAsync(
-                    BuildMessageOptions(prompt, envelope?.UpstreamAgent), TimeSpan.FromSeconds(10), cancellationToken);
-                if (!string.IsNullOrWhiteSpace(reply?.Data?.Content))
+                var reply = await SendSessionAsync(systemText, functions, prompt,
+                    envelope?.UpstreamAgent, TimeSpan.FromSeconds(10), cancellationToken);
+                if (!string.IsNullOrWhiteSpace(reply))
                 {
-                    var modelPlan = JsonSerializer.Deserialize<ToolInvocationPlan>(reply.Data.Content, JsonOptions);
+                    var modelPlan = JsonSerializer.Deserialize<ToolInvocationPlan>(reply, JsonOptions);
                     if (modelPlan is { Calls.Count: > 0 } && modelPlan.Calls.All(c => functions.ContainsKey(c.ToolName)))
                     {
                         ConnectionStatus = "CONNECTED_COPILOT_SDK_LIVE";
@@ -366,16 +432,15 @@ public sealed class CopilotSdkChatClientAdapter : IChatClient, IAsyncDisposable
         AIFunction function,
         Dictionary<string, object?> dynamicState)
     {
-        var resolved = new Dictionary<string, object?>(initialArgs);
+        var resolved = new Dictionary<string, object?>(initialArgs, StringComparer.OrdinalIgnoreCase);
         if (!function.JsonSchema.TryGetProperty("properties", out var properties))
         {
             return resolved;
         }
         foreach (var prop in properties.EnumerateObject())
         {
-            if ((!resolved.TryGetValue(prop.Name, out var existing) || existing is null)
-                && dynamicState.TryGetValue(prop.Name, out var chained)
-                && chained is not null)
+            // Missing evidence (including null) must never be replaced by a model's claim.
+            if (dynamicState.TryGetValue(prop.Name, out var chained))
             {
                 resolved[prop.Name] = chained;
             }
@@ -388,7 +453,7 @@ public sealed class CopilotSdkChatClientAdapter : IChatClient, IAsyncDisposable
         if (output.ValueKind != JsonValueKind.Object) return;
         foreach (var prop in output.EnumerateObject())
         {
-            if (prop.Value.ValueKind != JsonValueKind.Null && prop.Value.ValueKind != JsonValueKind.Undefined)
+            if (prop.Value.ValueKind != JsonValueKind.Undefined)
             {
                 dynamicState[prop.Name] = prop.Value;
             }

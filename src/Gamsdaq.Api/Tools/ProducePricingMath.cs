@@ -6,7 +6,24 @@ namespace Gamsdaq.Api.Tools;
 public static class ProducePricingMath
 {
     private static readonly string[] ExcludedGrades =
-        ["파지", "못난이", "주스용", "가공용", "흠과", "중소과", "혼합", "하품"];
+        ["파지", "못난이", "주스", "가공", "흠과", "중소과", "혼합", "하품", "보통", "중과", "소과", "가정용"];
+
+    public static bool MatchesTargetGradeStrict(string? adoptedGrade, string? targetGrade)
+    {
+        if (string.IsNullOrWhiteSpace(adoptedGrade) || string.IsNullOrWhiteSpace(targetGrade)) return false;
+        var adopted = adoptedGrade.Normalize(System.Text.NormalizationForm.FormKC);
+        if (ExcludedGrades.Any(term => adopted.Contains(term, StringComparison.OrdinalIgnoreCase))) return false;
+
+        static HashSet<string> Tokens(string grade) => System.Text.RegularExpressions.Regex
+            .Split(grade, @"[\s()/,\[\]·-]+").ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var targetTokens = Tokens(targetGrade.Normalize(System.Text.NormalizationForm.FormKC));
+        var adoptedTokens = Tokens(adopted);
+        if (targetTokens.Contains("로얄과") && (targetTokens.Contains("특등급") || targetTokens.Contains("특")))
+            return adoptedTokens.Contains("로얄과") && (adoptedTokens.Contains("특등급") || adoptedTokens.Contains("특"));
+        if (targetTokens.Contains("대과") && targetTokens.Contains("특품"))
+            return adoptedTokens.Contains("대과") && adoptedTokens.Contains("특품");
+        return false;
+    }
 
     public static int RoundToTick(decimal price, int tick) =>
         checked((int)(Math.Round(price / tick, 0, MidpointRounding.AwayFromZero) * tick));
@@ -37,11 +54,11 @@ public static class ProducePricingMath
             Reject("GATE-00_INDIRECT_INJECTION_BLOCKED", "외부 상품명/등급 텍스트에서 간접 프롬프트 인젝션 위험 패턴 감지");
         }
 
-        if (ExcludedGrades.Any(grade =>
+        if (!MatchesTargetGradeStrict(candidate.GradeText, ticker.Grade) || ExcludedGrades.Any(grade =>
             candidate.ProductTitle.Contains(grade, StringComparison.OrdinalIgnoreCase) ||
             candidate.GradeText.Contains(grade, StringComparison.OrdinalIgnoreCase)))
         {
-            Reject("GATE-01_QUALITY_MISMATCH", "목표 등급에 부합하지 않는 파지/혼합/가공용 등급");
+            Reject("GATE-01_QUALITY_MISMATCH", $"필수 등급({ticker.Grade}) 토큰 미충족 또는 하위/혼합 등급");
         }
         if (!candidate.GuaranteedBrix.HasValue || candidate.GuaranteedBrix.Value < ticker.MinBrix)
         {

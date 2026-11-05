@@ -220,7 +220,7 @@ public class GamsdaqTools
             TickerCode: ticker.Code,
             WholesalePrice: ticker.WholesalePrice,
             Source: "KAMIS 공영도매시장 및 산지 공판장 정산 기준가 (시뮬레이션 기준 데이터 스냅샷)",
-            AsOfDate: DateTime.UtcNow.AddHours(9).ToString("yyyy-MM-dd"),
+            AsOfDate: "2026-11-05",
             DataProvenance: "SIMULATED_PUBLIC_BENCHMARK",
             SourceUrl: "https://www.kamis.or.kr/customer/price/wholesale/item.do"
         );
@@ -327,23 +327,8 @@ public class GamsdaqTools
         );
     }
 
-    private static bool MatchesTargetGradeStrict(string? adoptedGrade, string? targetGrade)
-    {
-        if (string.IsNullOrWhiteSpace(adoptedGrade) || string.IsNullOrWhiteSpace(targetGrade))
-        {
-            return false;
-        }
-        string[] forbidden = ["파지", "못난이", "흠과", "가공", "주스", "중소과", "혼합", "하품"];
-        if (forbidden.Any(term => adoptedGrade.Contains(term, StringComparison.OrdinalIgnoreCase)))
-        {
-            return false;
-        }
-        var targetTokens = targetGrade
-            .Split([' ', '(', ')', '/', ','], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-            .Where(token => token.Length >= 2)
-            .ToArray();
-        return targetTokens.Length > 0 && targetTokens.Any(token => adoptedGrade.Contains(token, StringComparison.OrdinalIgnoreCase));
-    }
+    private static bool MatchesTargetGradeStrict(string? adoptedGrade, string? targetGrade) =>
+        ProducePricingMath.MatchesTargetGradeStrict(adoptedGrade, targetGrade);
 }
 
 public record NormalizedSpecResult(

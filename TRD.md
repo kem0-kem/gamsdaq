@@ -11,12 +11,13 @@
 ### 1.1 Step 1: 다중 소스 후보군 수집 및 결정론적 평가 엔진 (`ProducePricingMath.cs`)
 * 심사위원 및 자동화 평가 에이전트(AI Judge)가 외부 API 키 없이도 **100% 재현 가능한(Zero-External-Key, 100% Reproducible) 검증 결과**를 즉시 확인할 수 있도록, 이커머스 후보군(`search_ecommerce_listings`)과 KAMIS/산지 공판장 도매 기준가(`fetch_wholesale_benchmark`)는 **Deterministic Benchmark Snapshot + Real-Time 4-Gate Formula Evaluation Engine**으로 동작합니다.
 * **불변식**: 시드 후보군의 초기 `IsPassed`/`Effective3KgOr5KgPrice`는 모두 `false`/`0`으로 리셋된 후, 매 요청마다 `ProducePricingMath.Evaluate`와 `ProducePricingMath.Verify`가 원시 데이터로부터 실시간 재계산합니다. 적격 통과 후보가 0건이면 $P_{\text{retail}} = 0$으로 Fail-Closed 처리되어 허위 상한선 거래를 원천 차단합니다.
+* **기준일 고정**: `fetch_wholesale_benchmark.AsOfDate = "2026-11-05"`이며 호출 시각을 고정 가격의 수집일로 표시하지 않습니다. 소매 후보 `CollectedAtKst`도 같은 스냅샷 기준일입니다.
 
 ### 1.2 Step 2: 간접 인젝션 방어 및 4-Gate 미끼 판정 규칙 (`ProducePricingMath.Evaluate`)
 목표 티커 스펙 $T = (\text{Crop}, \text{Origin}, B_{\text{target}}, W_{\text{target}}, G_{\text{target}})$과 대조하며, 모든 위반 코드를 `RejectionCodes` 배열에 누적 기록합니다.
 
 * **Gate 0 — 외부 상품명 간접 프롬프트 인젝션 방어 (`GATE-00_INDIRECT_INJECTION_BLOCKED`)**: 외부 쇼핑몰 상품명(`ProductTitle`)·등급(`GradeText`)을 `PromptShieldGuardrail.ValidateAndSanitize`로 검사하여 악성 명령어나 스크립트가 포함된 후보를 즉시 차단합니다.
-* **Gate 1 — 품목·등급·파지 배제 (`GATE-01_QUALITY_MISMATCH`)**: 상품명 또는 등급에 `["파지", "못난이", "주스용", "가공용", "흠과", "중소과", "혼합", "하품"]` 포함 시 즉시 탈락.
+* **Gate 1 — 필수 등급 동등성 (`GATE-01_QUALITY_MISMATCH`)**: 감귤은 `로얄과`와 `특등급`/`특`, 반시는 `대과`와 `특품` 토큰을 모두 충족해야 합니다. 상품명 또는 등급의 `보통`, `중과`, `소과`, `혼합`, `가정용`, `파지`, `못난이`, `흠과`, `가공`, `주스`, `하품` 등은 탈락입니다. 감사 도구와 동일한 `MatchesTargetGradeStrict` 규칙을 사용하며 한 토큰의 부분 문자열 일치로 통과시키지 않습니다.
 * **Gate 2 — 당도(Brix) 동등성 검증 (`GATE-02_BRIX_UNVERIFIED`)**: 보장 당도(`GuaranteedBrix`)가 `null`이거나 $B_{\text{target}}$(`12 Brix` / `13 Brix`) 미만이면 탈락.
 * **Gate 3 — 소포장 옵션 미끼 필터 (`GATE-03_BAIT_WEIGHT_OPTION`)**: 표기 중량 $W_{\text{actual}, i} < 0.6 \times W_{\text{target}}$(3kg 기준 1.8kg 미만, 5kg 기준 3.0kg 미만)인 맛보기 소포장 옵션 탈락.
 * **Gate 4 — 배송비 합산 실질 환산가($P_{\text{eff}, i}$) 산출 및 덤핑 이상치/배송비 주의 판정**:
@@ -30,15 +31,18 @@
 
 | 티커 | 후보 ID | 판매처 | 표기가 ($P_{\text{listed}}$) | 배송비 ($P_{\text{shipping}}$) | 중량 ($W_{\text{actual}}$) | 보장 당도 | 등급 표기 | 3kg/5kg 실질환산가 ($P_{\text{eff}, i}$) | 4-Gate 판정 코드 (`RejectionCodes`) | 최종 채택 |
 |---|---|---|---:|---:|---:|---:|---|---:|---|---|
-| **`JJ-GYUL-12B-3KG`**<br>($W=3\text{kg}$, $B=12$, $P_{\text{wholesale}}=9,200$) | `EC-G1` | 오픈마켓 A몰 | 9,900원 | 4,500원 | 1.0kg | 12B | 로얄과 | **43,200원** ($\frac{14400}{1.0}\times 3$) | `GATE-03_BAIT_WEIGHT_OPTION` (배송비 45.5% 주의) | **탈락** |
+| **`JJ-GYUL-12B-3KG`**<br>($W=3\text{kg}$, $B=12$, $P_{\text{wholesale}}=9,200$) | `EC-G1` | 오픈마켓 A몰 | 9,900원 | 4,500원 | 1.0kg | 12B | 로얄과 특등급 | **43,200원** ($\frac{14400}{1.0}\times 3$) | `GATE-03_BAIT_WEIGHT_OPTION` (배송비 45.5% 주의) | **탈락** |
 | | `EC-G2` | 오픈마켓 B몰 | 11,500원 | 3,000원 | 3.0kg | 9B | 가정용 파지/혼합 | **14,500원** ($\frac{14500}{3.0}\times 3$) | `GATE-01_QUALITY_MISMATCH`, `GATE-02_BRIX_UNVERIFIED` | **탈락** |
-| | `EC-G3` | 소셜커머스 C몰 | 11,900원 | 5,000원 | 3.0kg | 12B | 로얄과 | **16,900원** ($\frac{16900}{3.0}\times 3$) | `GATE_PASS` (`ShippingRatioWarning: true`, 42.0%) | 통과 |
-| | `EC-G4` | 산지직송 D몰 | 15,800원 | 0원 | 3.0kg | 12B | 로얄과 | **15,800원** ($\frac{15800}{3.0}\times 3$) | **`GATE_PASS_LOWEST_ADOPTED`** | **채택 ($15,800\text{원}$)** |
-| | `EC-G5` | 백화점몰 E몰 | 17,500원 | 0원 | 3.0kg | 12B | 특등급 | **17,500원** ($\frac{17500}{3.0}\times 3$) | `GATE_PASS` | 통과 |
+| | `EC-G3` | 소셜커머스 C몰 | 11,900원 | 5,000원 | 3.0kg | 12B | 로얄과 특등급 | **16,900원** ($\frac{16900}{3.0}\times 3$) | `GATE_PASS` (`ShippingRatioWarning: true`, 42.0%) | 통과 |
+| | `EC-G4` | 산지직송 D몰 | 15,800원 | 0원 | 3.0kg | 12B | 로얄과 특등급 | **15,800원** ($\frac{15800}{3.0}\times 3$) | **`GATE_PASS_LOWEST_ADOPTED`** | **채택 ($15,800\text{원}$)** |
+| | `EC-G5` | 백화점몰 E몰 | 17,500원 | 0원 | 3.0kg | 12B | 로얄과 특등급 | **17,500원** ($\frac{17500}{3.0}\times 3$) | `GATE_PASS` | 통과 |
 | **`CD-BANSI-13B-5KG`**<br>($W=5\text{kg}$, $B=13$, $P_{\text{wholesale}}=14,000$) | `EC-B1` | 오픈마켓 A몰 | 12,900원 | 4,000원 | 2.5kg | 13B | 중소과 | **33,800원** ($\frac{16900}{2.5}\times 5$) | `GATE-01_QUALITY_MISMATCH`, `GATE-03_BAIT_WEIGHT_OPTION` | **탈락** |
 | | `EC-B2` | 오픈마켓 B몰 | 15,900원 | 3,500원 | 5.0kg | 10B | 가정용 파지 | **19,400원** ($\frac{19400}{5.0}\times 5$) | `GATE-01_QUALITY_MISMATCH`, `GATE-02_BRIX_UNVERIFIED` | **탈락** |
 | | `EC-B3` | 산지직송 C몰 | 24,800원 | 0원 | 5.0kg | 13B | 대과 특품 | **24,800원** ($\frac{24800}{5.0}\times 5$) | **`GATE_PASS_LOWEST_ADOPTED`** | **채택 ($24,800\text{원}$)** |
 | | `EC-B4` | 오픈마켓 D몰 | 23,000원 | 3,500원 | 5.0kg | 13B | 대과 특품 | **26,500원** ($\frac{26500}{5.0}\times 5$) | `GATE_PASS` | 통과 |
+| | `EC-B5` | 백화점몰 E몰 | 27,200원 | 0원 | 5.0kg | 13B | 대과 특품 | **27,200원** | `GATE_PASS` | 통과 |
+
+**시드 벤치마크 후보군(10건) 기준 미끼 상품 100% 필터링**은 미끼 4건 중 4건 제외, 적격 6건 통과를 뜻합니다. 전체 오픈마켓이나 알려지지 않은 공격에 대한 탐지율 보장이 아닙니다. 감귤 시뮬레이션의 정품 등급 필드는 두 필수 토큰을 명시하도록 보정했으며 실제 쇼핑몰 상품의 등급을 재확인했다는 뜻은 아닙니다.
 
 ### 1.4 Step 4: 상생 가격 밴드 및 호가창 수급(OBI) 최적 호가($P_{\text{opt}}$) 수식 및 검산
 * **파라미터 상수 (`ProducePricingMath.ComputeQuote`)**: 도매가 가중치 $w = 0.48$, 소매 최저가 가중치 $1-w = 0.52$, 수급 민감도 $\gamma = 0.08$, 분모 안정화 상수 $\epsilon = 1$, 양측 최소 보장 마진 $500\text{원}$.
@@ -68,12 +72,14 @@ flowchart LR
     A5 -.->|"RETRY (최대 2회)"| A4
 ```
 
-### 2.1 SDK 버전 및 `CopilotSdkChatClientAdapter` 이중 모드 아키텍처
+### 2.1 SDK 버전 및 `CopilotSdkChatClientAdapter` 실행 모드 아키텍처
 * **NuGet 패키지 버전 (`src/Gamsdaq.Api/Gamsdaq.Api.csproj`)**: `GitHub.Copilot.SDK` (`1.0.29-preview.8`), `Microsoft.Agents.AI` (`1.27.0`), `Microsoft.Extensions.AI` (`10.11.0`), `Microsoft.ApplicationInsights.AspNetCore` (`3.2.0`), `OpenTelemetry.Extensions.Hosting` (`1.19.1`).
 * **`CopilotSdkChatClientAdapter : IChatClient, IAsyncDisposable` 동작 메커니즘**:
   1. **도구 바인딩 에이전트 실행 (`toolExecutionMode: "DETERMINISTIC_AIFUNCTION"`)**: `ChatClientAgent.RunAsync` 호출 시 `ChatOptions.Tools`에 바인딩된 `AIFunction` 목록을 사전 Allowlist로 검증(미바인딩 도구 요청 시 실행 전 `InvalidOperationException` 차단)하고, 각 `AIFunction.InvokeAsync`를 실제 호출하여 표준 `FunctionCallContent`/`FunctionResultContent`와 도구별 실행 시간(`LatencyMs`), 결과 JSON(`AgentToolExecution`)을 반환합니다.
   2. **라이브 Copilot 세션 연결 (`copilotSessionMode`)**: 바인딩된 도구가 없는 비정형 대화 요청은 `Lazy<CopilotClient>`로 `CreateSessionAsync` -> `SendAndWaitAsync`를 호출하며, 실패 시 가짜 성공 문자열로 위장하지 않고 예외를 투명하게 전파합니다(`GET /api/health`에서 `toolExecutionMode`와 `copilotSessionMode`를 분리 표기).
   3. **도구 선택과 사후 요약 분리**: 모델이 도구를 선택한 경우만 `COPILOT_SDK_MODEL_DIRECTED_AIFUNCTION`입니다. 결정론적으로 선택한 도구 결과를 SDK가 요약만 한 경우 `COPILOT_SDK_SYNTHESIS_WITH_AIFUNCTION`으로 표시하며, 요약 실패가 모델 주도 선택 여부를 바꾸지 않습니다. 요청 취소는 fallback으로 숨기지 않고 전파합니다.
+  4. **SDK 네이티브 실행 추적**: `BuildSessionConfig`에 전달하는 도구는 `SessionAIFunction : DelegatingAIFunction`으로 래핑됩니다. SDK RPC 콜백도 동일한 신뢰 인자 강제·도구 기록·지연 계측을 거치며 호출 시점의 검증 작업 사본 `ExecutionContext`를 유지합니다. 동시 호출은 요청별 세마포어로 직렬화하고, 네이티브에서 이미 완료한 동일 인자 호출은 반환된 JSON 계획에서 중복 실행하지 않습니다. 결과는 `FunctionCallContent`/`FunctionResultContent`, SSE `ToolCalls`에 포함되며 모드는 `COPILOT_SDK_NATIVE_AIFUNCTION`입니다.
+  5. **health 정합성**: `/api/health.toolExecutionMode`는 어댑터의 `LastToolExecutionMode`를 읽습니다. 실행 전 `NOT_EXECUTED`를 포함한 `supportedExecutionModes`를 반환하며, 전역 최근 실행 모드이므로 개별 요청은 SSE `ExecutionMode`를 기준으로 판단합니다.
 
 ### 2.2 에이전트별 역할 및 10개 C# `AIFunction` 도구 입출력 스키마
 
@@ -86,12 +92,17 @@ flowchart LR
 | **5** | **`AuditorGuardrailAgent`** | `audit_quote_invariants` | 가격 3종·미끼 제외 수, 채택/목표 Brix·등급, 출처 존재 여부·채택 URL | `AuditResult` (`AuditPassed`, 가격·호가단위·미끼제외·스펙·출처 불변식 플래그) |
 
 ### 2.3 Maker-Checker 재시도 종료 규칙 및 프롬프트 인젝션 방어
+* **감사 입력 신뢰 경계 (Trusted State Override)**: `ResolveChainedArguments`는 도구 스키마의 인자 중 `dynamicState`에 존재하는 키를 모델의 `initialArgs`보다 항상 우선 적용합니다. `null`도 신뢰된 누락 증거로 유지하므로 모델이 임의 당도·등급·출처로 보완할 수 없습니다. 구조화된 상위 도구 출력과 서버 핸드오프를 가격·당도·필수 등급·출처 감사의 기준으로 사용합니다. 악의적인 `modelToolPlanner` 회귀 테스트가 조작된 감사 가격/당도/등급/출처의 강제 덮어쓰기와 최종 `AUDIT_FAILED`를 검증합니다.
 * **감사 전 격리와 원자적 확정**: `CaptureVerificationCheckpoint`는 티커·후보군, 매수/매도 FIFO 큐 전체(`Quantity`는 미체결 잔량, `Timestamp`와 `IsWalletFunded` 포함), `_virtualBalance` 및 `_reservedBalance`를 깊은 복사합니다. 이 구현에는 별도 `_orders`나 사용자별 `_portfolios`가 없으며 단일 시뮬레이션 지갑을 사용합니다.
 * `GamsdaqTools`는 각 비동기 에이전트 단계의 `AsyncLocal` 범위에서 요청 전용 `MarketEngineService` 작업 사본을 사용합니다. 따라서 `verify_four_gate_lowest_price`와 `compute_win_win_optimal_quote`가 감사 전 공개 시장을 변경하지 않습니다. 도구의 직접 호출은 기존 엔진 동작과 호환되며, 공개 SSE/자연어 파이프라인은 반드시 작업 사본을 사용합니다.
 * `STEP-1`~`STEP-5` 순서와 `STEP-4 COMPLETED` 상태를 유지하면서 요약에 `[감사 대기]`를 붙입니다. 감사 통과 시 `TryCommitVerification`이 시장 버전을 확인하고 가격·후보·주문 취소·예약금 해제를 한 잠금에서 확정합니다. 감사 도중 주문이나 초기화가 발생하면 오래된 결과는 `AUDIT_FAILED`로 끝내며 동시 변경을 덮어쓰지 않습니다.
 * 감사 실패·도구 예외·요청 취소·SSE 열거 조기 종료는 `finally`의 `RestoreCheckpoint`로 작업 사본의 FIFO 주문과 예수금까지 복원합니다. 확정 도중 예외는 같은 잠금 안에서 공개 시장 체크포인트를 복원합니다. 관련 회귀 테스트는 `AgentPipeline_IsolatesPruningUntilAuditAndCommitsOnlyPassedResults`, `AgentPipeline_ExceptionAfterPruningRestoresOrdersAndReservedCash`, `AgentPipeline_CancellationOrEarlyDisposalRestoresPrivateCheckpoint`, `AgentPipeline_ConcurrentMarketChangeRejectsStaleCommitWithoutUndoingNewState`입니다.
 * **Maker-Checker 감사 및 재시도 상한 (`maxRetries = 2`)**: `AuditorGuardrailAgent`는 ① 엄격 부등식 **$P_{\text{wholesale}} < P_{\text{opt}} < P_{\text{retail}}$**, ② $P_{\text{opt}} \pmod{100} = 0$, ③ `rejectedBaitCount > 0`을 검증합니다. 위반 시 `AUDIT_RETRY` SSE 이벤트를 방출하고 안전 경계($[P_{\text{wholesale}}+500, P_{\text{retail}}-500]$)를 주입하여 **최대 2회(`maxRetries = 2`)** 재산출합니다. 2회 재시도 후에도 실패하면 `AUDIT_FAILED`를 반환합니다.
-* **프롬프트 인젝션 방어 (`PromptShieldGuardrail.ValidateAndSanitize`)**: 300자 길이 절단 **이전에** 전체 문자열에 대해 유니코드 `FormKC` 정규화, 제로폭 문자(`\u200B-\u200D\uFEFF`) 제거, 공백·기호 압축(`Compact`)을 수행하여 300자 뒤에 숨긴 우회 페이로드까지 100% 차단(`STEP-0 BLOCKED`)하며, 정상 농가 문장 오탐을 방지하도록 복합 인젝션 구문 패턴을 정밀화했습니다.
+* **프롬프트 인젝션 방어 (`PromptShieldGuardrail.ValidateAndSanitize`)**: 300자 길이 절단 **이전에** 유니코드 `FormKC` 정규화, 제로폭 문자(`\u200B-\u200D\uFEFF`) 제거, 공백·기호 압축(`Compact`)을 수행합니다. **알려진 프롬프트 인젝션 및 비규격 패턴 결정론적 차단 (회귀 테스트 검증)** 범위이며, 300자 뒤 공격 등 등록된 사례를 검증하지만 모든 미지 공격의 차단을 보장하지 않습니다.
+
+### 2.4 지역 근거와 생산성 측정 범위
+* 전체 인구는 **행정안전부 주민등록인구통계·경상북도 청도군**(41.3%는 2023-08 말 보도 인용값), 농가 인구는 **통계청 2020 농림어업총조사·청도군**으로 모집단을 구분합니다. 비용 구조는 **한국농수산식품유통공사(aT) 2023년 농산물 유통실태조사**의 품목·경로별 표본 자료입니다([공식 출처 및 인용 범위](./cheongdo-social-issues.md#3-통계-출처기준시점-및-검증-범위)).
+* **기존 6단계 수기 입력 대비 3단계 워크플로우 축소 기대치**는 UI 설계 비교입니다. **서버 파이프라인 약 5~15ms**는 결정론적 웜 실행의 설계 참고 범위(이번 테스트 실측값·보장값 아님)이며, 실제 서버 실행 시간 `elapsedMs`에는 사용자의 입력·검토·승인 시간이 포함되지 않습니다.
 
 ---
 
@@ -130,13 +141,13 @@ flowchart LR
 2. **Azure Container Registry (`Basic`) & 멀티스테이지 `Dockerfile`**: Node 22 프론트엔드 빌드 + .NET 10 SDK 빌드 -> .NET 10 ASP.NET 런타임(포트 `8080`). `deployContainerApp` 조건부 파라미터로 ACR 선프로비저닝 및 이미지 빌드 후 Container App 배포 2단계 구성을 지원합니다.
 3. **Log Analytics (`PerGB2018`) & Application Insights (`web`)**: `GamsdaqTelemetry.cs`의 OpenTelemetry `ActivitySource("Gamsdaq.Agents")` 및 `Meter("Gamsdaq.Metrics")` 7종 지표를 수집합니다.
 4. **Azure Container Apps (`*.azurecontainerapps.io`)**: `koreacentral`, 외부 인그레스(`targetPort: 8080`), `0.5 vCPU` / `1.0Gi`, `minReplicas: 1, maxReplicas: 1`(불필요한 HTTP 스케일 규칙 제거), `/api/health` Liveness/Readiness 프로브.
-5. **CI/CD (`.github/workflows/deploy-azure.yml`)**: `az bicep build` 검증 + `dotnet test` (122+개 테스트) + `npm run build` -> `az deployment group create (deployContainerApp=false)` -> `az acr build` -> `az deployment group create (deployContainerApp=true)` -> `/api/health`, `/api/tickers`, `/api/agents/verify-stream` SSE 라이브 스모크 체크.
+5. **CI/CD (`.github/workflows/deploy-azure.yml`)**: `az bicep build` 검증 + `dotnet test` (149개 테스트) + `npm run build` -> `az deployment group create (deployContainerApp=false)` -> `az acr build` -> `az deployment group create (deployContainerApp=true)` -> `/api/health`, `/api/tickers`, `/api/agents/verify-stream` SSE 라이브 스모크 체크.
 
 ---
 
 ## 6. 구현 소스코드 매핑 및 자동화 테스트 검증 명세 (109 Test Cases)
 
-`dotnet test Gamsdaq.sln --configuration Release`로 `tests/Gamsdaq.Tests/GamsdaqEngineTests.cs`의 **122+개 단위·경계값·동시성 테스트**를 검증합니다. 정확한 최신 통과 수는 해당 실행 결과를 기준으로 합니다.
+`dotnet test Gamsdaq.sln --configuration Release`로 `tests/Gamsdaq.Tests/GamsdaqEngineTests.cs`의 **149개 단위·경계값·동시성 테스트**를 검증합니다. 네이티브 도구 테스트는 실제 `SessionConfig.Tools` 래퍼를 주입한 전송 대역에서 호출하며, 인증된 라이브 SDK 세션을 검증했다는 뜻은 아닙니다.
 
 | 검증 영역 | 구현 파일 경로 | 대표 자동화 테스트 메서드 (`GamsdaqEngineTests.cs`) | 검증된 핵심 불변식 |
 |---|---|---|---|
@@ -145,4 +156,3 @@ flowchart LR
 | **다단계 Price-Time Priority 매칭 엔진** | `Matching/MarketEngineService.cs` | `Buy_WalksTwoLevels_DeductsExactTotalAndLeavesRealPartialDepth`<br>`BuyMarket_InsufficientBalanceAtSecondLevel_IsAtomic`<br>`SellLimit_ExecutesAtRestingBestBidNotIncomingLimit`<br>`SamePriceOrders_FillInFifoOrderAndPreservePartialOrdersTimestamp`<br>`ConcurrentBuys_DoNotOverfillOrLoseQuantity`<br>`MarketEngineService_MasksPhonePiiAndSupportsDemoReset` | 다단계 Walk-the-Book, 지정가 예약금 관리, 50개 동시 매수 스레드 안전성, 연락처 마스킹 및 데모 초기화 |
 | **Responsible AI & 프롬프트 인젝션 방어** | `Security/PromptShieldGuardrail.cs` | `PromptShield_BlocksNormalizedOverrideAndMarkupPatterns`<br>`PromptShield_InspectsInjectionAfterThreeHundredCharactersBeforeLengthRejection`<br>`PromptShield_AllowsBenignFarmerSentencesAndBlocksIndirectCandidateInjection`<br>`OrderGuardrail_EnforcesBothBoundsTickAndQuantity` | 300자 뒤 인젝션 선탐지 차단, 간접 인젝션(`GATE-00`) 차단, 엄격 부등식($P_{\text{wholesale}} < P < P_{\text{retail}}$) 강제 |
 | **OpenTelemetry 관측성** | `Diagnostics/GamsdaqTelemetry.cs` | `Telemetry_EmitsAgentToolAndMatchingActivitiesAndMetrics` | 에이전트 단계별 Trace Activity 및 미끼 탈락률·매칭 지연 시간 Histogram 메트릭 실시간 방출 검증 |
-

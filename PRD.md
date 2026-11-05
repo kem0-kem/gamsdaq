@@ -7,8 +7,8 @@
 ## 1. 제품 비전, 지역 문제 맥락 및 정량 목표 (Product Vision & Regional Impact)
 
 * **지역 사회 문제 정의 (`cheongdo-social-issues.md` 연계)**:
-  * 경상북도 청도군은 **65세 이상 고령 인구 비율 약 42%의 초고령 농촌 지역**이자 전국 최대 씨 없는 감(**청도 반시·감말랭이**) 주산지입니다.
-  * 고령 농가는 ① 오픈마켓 입점·상세페이지 제작·옵션 설정의 디지털 장벽, ② 당일 시세 및 적정 출하가 정보 비대칭, ③ 산지 공판장 위탁 출하 시 상장수수료·물류비·중간 유통 마진 공제로 인해 **최종 소비자가의 50~55% 수준에 불과한 낮은 농가 수취율**을 겪고 있습니다.
+  * 경상북도 청도군의 **전체 주민등록 인구 중 65세 이상 비율 41.3%**는 **2023-08 말 기준** 행정안전부 주민등록인구통계 기준의 [보도 인용값](https://www.kyongbuk.co.kr/news/articleView.html?idxno=2142619)입니다. 최신값이나 농가 고령화율이 아니며, 농가 인구는 **통계청 2020 농림어업총조사·경상북도 청도군 기준**으로 따로 확인합니다([출처·모집단 구분](./cheongdo-social-issues.md#3-통계-출처기준시점-및-검증-범위)).
+  * 고령 농가는 ① 오픈마켓 입점·상세페이지·옵션 설정의 디지털 장벽, ② 적정 출하가 정보 비대칭, ③ 유통비용으로 인한 수취액 감소 문제를 겪을 수 있습니다. 비용 구조 출처는 **한국농수산식품유통공사(aT) [2023년 농산물 유통실태조사](https://www.kamis.or.kr/customer/circulation/domestic/analysis.do?action=detail&brdctsno=443961)**입니다. 기존 “농가 수취율 50~55%”는 청도 반시 실측값으로 확인되지 않아 삭제하며, 본 제품의 도소매 가격은 별도 시뮬레이션 가정입니다.
   * 반대로 도시 소비자는 온라인 구매 시 **1kg 소포장 맛보기 옵션을 대표가로 내세우는 '옵션치기'**, **상품가 대비 35%를 넘는 '배송비 폭탄'**, **파지·혼합과를 정품처럼 파는 '등급 왜곡'** 등 미끼 상품에 피로감을 느낍니다.
 * **제품 비전**: 비정형 농산물을 당도(Brix)·중량(kg)·등급 기준의 **표준 티커(Standardized Produce Ticker)**로 규격화하고, **5단계 멀티 에이전트(`GitHub.Copilot.SDK` + `Microsoft.Agents.AI`)**가 4-Gate 수식으로 검증한 인터넷 실질 최저가($P_{\text{retail}}$)와 산지 도매 기준가($P_{\text{wholesale}}$) 사이의 **상생 가격 밴드($P_{\text{wholesale}} < P < P_{\text{retail}}$)** 안에서 농부와 소비자가 토스증권처럼 직관적으로 호가를 걸고 즉시 체결하는 **AI 검증 농산물 호가 거래소**를 구축합니다.
 * **2대 표준 품목(티커) 선정 근거 및 확장 체계**:
@@ -29,7 +29,7 @@
 * **핵심 정량 목표 및 코드 계측 기준 (`POST /api/farmers/natural-quote` 응답 `elapsedMs`, `clicksEquivalent` 포함)**:
   1. **농가 수취가 향상**: 공판장 도매 기준가($P_{\text{wholesale}}$) 대비 농가 수취액 **20% 이상 증대** (시뮬레이션 기대치: **$+34.8\% \sim +39.3\%$**).
   2. **소비자 구매가 절감**: 동일 스펙 인터넷 실질 최저가($P_{\text{retail}}$) 대비 **15% 이상 절감** (시뮬레이션 기대치: **$-19.6\% \sim -23.8\%$**).
-  3. **등록/주문 소요 시간 단축**: 자연어 입력 후 `[AI 호가산출]` -> `[호가 등록]` -> `[최종 승인]` **3클릭(`clicksEquivalent = 3`)**을 지원합니다. 서버 처리 시간은 응답 `elapsedMs`로 계측하며, 모델 연결 모드에 따라 달라지고 실제 고령 농가 사용자 실험 수치와는 구분합니다.
+  3. **워크플로우 축소 기대치**: 기존 6단계 수기 입력(품목·산지·당도·중량·등급·수량) 대비 자연어 입력 후 `[AI 호가산출]` -> `[호가 등록]` -> `[최종 승인]` **3단계(`clicksEquivalent = 3`)**를 지원합니다. 사용자 조작 시간 단축률은 미측정입니다. **서버 파이프라인 약 5~15ms**는 결정론적 웜 실행의 설계 참고 범위(이번 테스트 실측값·보장값 아님)이며 실제 서버 시간 `elapsedMs`와도 구분합니다. `elapsedMs`에는 사용자 입력·검토·승인 시간이 포함되지 않습니다.
 
 ---
 
@@ -72,6 +72,7 @@ flowchart LR
 * **FR-04: Price-Time Priority 다단계 주문 매칭 엔진**
   * 지정가(`LIMIT`)·시장가(`MARKET`) 다단계 호가 탐색(Walk-the-Book), 부분 체결, 동일 가격 내 `LinkedList` FIFO 시간 우선 원칙, 지정가 미체결 예약금(`_reservedBalance`) 원자적 검증, 체결 후 `AiOptimalPrice` 즉시 재산출을 수행한다.
 * **FR-05: Responsible AI, 엄격한 상생 가격 부등식 가드레일 및 PII 마스킹**
+  * 감사 및 검증 도구 인자는 모델 제안보다 신뢰된 핸드오프/도구 출력이 항상 우선하며 `null` 증거도 모델이 채우지 못한다. 감귤은 `로얄과`와 `특등급`/`특`, 반시는 `대과`와 `특품`을 모두 요구하고 하위·혼합 등급은 거부한다.
   * 감사 전 가격/후보/주문 취소/예약금 변경은 요청별 작업 사본에 격리한다. `STEP-4`에는 `[감사 대기]`를 표시하고 감사 통과 및 시장 버전 일치 시에만 원자적으로 확정한다. 실패·예외·취소·스트림 중단 시 체크포인트의 FIFO 주문 전체와 가상 예수금/예약금까지 복원하며 동시 가상 거래는 보존한다.
   * 300자 절단 전 전체 문자열 유니코드 NFKC 정규화 인젝션 차단(`PromptShieldGuardrail`) 및 외부 상품명 간접 인젝션 차단(`GATE-00_INDIRECT_INJECTION_BLOCKED`).
   * 상생 가격 엄격 부등식(**$P_{\text{wholesale}} < P < P_{\text{retail}}$**, 100원 호가 단위)을 벗어난 지정가 주문은 매수·매도 양방향 모두 즉시 차단한다.
@@ -105,9 +106,8 @@ flowchart LR
 | **CRIT-01** | **Copilot SDK & Agent Framework (25%)** | `GitHub.Copilot.SDK` (`1.0.29-preview.8`) + `Microsoft.Agents.AI` (`1.27.0`) 5-에이전트, 10개 `AIFunction` 호출, Maker-Checker 2회 재시도 | `src/Gamsdaq.Api/Agents/CopilotAgentOrchestrator.cs`<br>`src/Gamsdaq.Api/Tools/GamsdaqTools.cs`<br>`POST /api/agents/verify-stream` |
 | **CRIT-02** | **생산성 향상 및 문제 적합성 (18%)** | 청도 반시 농가 수취가 $+35.0\%\sim+39.3\%$ 증대, 소비자 $-19.6\%\sim-23.8\%$ 절감, 3클릭 자연어 출하 | `POST /api/farmers/natural-quote`<br>`JJ-GYUL-12B-3KG`, `CD-BANSI-13B-5KG` |
 | **CRIT-03** | **Azure 클라우드 아키텍처 (18%)** | Azure Container Apps (`minReplicas: 1, maxReplicas: 1`), ACR, Managed Identity, App Insights, OpenTelemetry | `infra/main.bicep`, `Dockerfile`<br>`.github/workflows/deploy-azure.yml`<br>`src/Gamsdaq.Api/Diagnostics/GamsdaqTelemetry.cs` |
-| **CRIT-04** | **기능적 완성도 (16%)** | 무인증 즉시 접근, 다단계 FIFO 매칭, 예약금/잔고 차감, 장바구니·배송, 데모 초기화, **122+개 테스트** (`dotnet test Gamsdaq.sln --configuration Release`) | `src/Gamsdaq.Api/Matching/MarketEngineService.cs`<br>`POST /api/orders`, `POST /api/demo/reset`<br>`tests/Gamsdaq.Tests/GamsdaqEngineTests.cs` |
+| **CRIT-04** | **기능적 완성도 (16%)** | 무인증 즉시 접근, 다단계 FIFO 매칭, 예약금/잔고 차감, 장바구니·배송, 데모 초기화, **149개 테스트** (`dotnet test Gamsdaq.sln --configuration Release`) | `src/Gamsdaq.Api/Matching/MarketEngineService.cs`<br>`POST /api/orders`, `POST /api/demo/reset`<br>`tests/Gamsdaq.Tests/GamsdaqEngineTests.cs` |
 | **CRIT-05** | **사용자 경험 (UX) (12%)** | `[호가]`/`[차트]`/`[AI 최저가 4-Gate 검증원장]` 전환, 큰글씨 모드, 라이트 테마, 3색·`0px` 직각·`Pretendard` | `src/gamsdaq-web/src/main.ts`<br>`src/gamsdaq-web/src/style.css` |
 | **CRIT-06** | **책임 있는 AI (6%)** | 절단 전 NFKC 정규화 인젝션 차단, 간접 인젝션 차단(`GATE-00`), 엄격 부등식($P_{\text{wholesale}} < P < P_{\text{retail}}$), HITL 모달, 연락처 마스킹 | `src/Gamsdaq.Api/Security/PromptShieldGuardrail.cs`<br>`ProducePricingMath.Evaluate` |
 | **CRIT-07** | **창의성 및 혁신성 (5%)** | 비정형 농산물 표준 티커화 + AI 4-Gate 미끼 상품 필터링 + 실시간 양방향 호가 거래소(OBI 동적 호가) 결합 | `ProducePricingMath.Verify`<br>`ProducePricingMath.ComputeQuote` |
-
 

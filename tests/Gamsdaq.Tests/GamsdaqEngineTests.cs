@@ -228,7 +228,7 @@ public class GamsdaqEngineTests
     private const string Bansi = "CD-BANSI-13B-5KG";
 
     private static EcommerceCandidate Candidate(string id = "SYNTHETIC") =>
-        new(id, "Synthetic source", "12브릭스 노지 감귤 3kg", 15_800, 0, 3m, 12, "로얄과",
+        new(id, "Synthetic source", "12브릭스 노지 감귤 3kg", 15_800, 0, 3m, 12, "로얄과 특등급",
             1, false, "STALE_VERDICT", "Untrusted seed verdict", "https://example.test/listing");
 
     private static SubmitOrderResponse Submit(MarketEngineService engine, string side, int price, int quantity,
@@ -834,6 +834,177 @@ public class GamsdaqEngineTests
     }
 
     [Fact]
+    public void GradeEquivalence_RequiresEveryTickerTokenAndRejectsLowerGradesInBothGatesAndAudit()
+    {
+        var engine = new MarketEngineService();
+        var tools = new GamsdaqTools(engine);
+        foreach (var ticker in engine.GetAllTickers())
+        {
+            string[] valid = ticker.Code == Gyul ? ["로얄과 특등급", "로얄과 (특)"] : ["대과 특품", "특품 (대과)"];
+            string[] incomplete = ticker.Code == Gyul ? ["로얄과", "특등급", "로얄과 특가", "로얄과 특품"]
+                : ["대과", "특품", "대과 특등급", "대과 특품아님"];
+            string[] lower = ["보통", "중과", "소과", "혼합", "가정용", "파지", "못난이", "흠과"];
+            var cases = valid.Select(grade => (Grade: grade, Pass: true))
+                .Concat(incomplete.Concat(lower.Select(grade => $"{valid[0]} {grade}")).Select(grade => (Grade: grade, Pass: false)));
+            foreach (var test in cases)
+            {
+                var candidate = Candidate() with
+                {
+                    ListedWeightKg = ticker.WeightKg, GuaranteedBrix = ticker.MinBrix,
+                    ListedPrice = ticker.VerifiedRetailLowestPrice, GradeText = test.Grade
+                };
+                Assert.Equal(test.Pass, tools.EvaluateBaitRulesTool(ticker.Code, candidate).IsPassed);
+                Assert.Equal(test.Pass, tools.AuditQuoteInvariantsTool(ticker.WholesalePrice, ticker.AiOptimalPrice,
+                    ticker.VerifiedRetailLowestPrice, 2, ticker.MinBrix, ticker.MinBrix, test.Grade,
+                    ticker.Grade, true, "https://www.coupang.com/np/search?q=produce").AuditPassed);
+            }
+        }
+    }
+
+    [Fact]
+    public void WholesaleBenchmark_UsesFixedSnapshotDateRatherThanRequestDate()
+    {
+        var tools = new GamsdaqTools(new MarketEngineService());
+        foreach (var code in new[] { Gyul, Bansi })
+        {
+            var benchmark = tools.FetchWholesaleBenchmarkTool(code);
+            Assert.Equal("2026-11-05", benchmark.AsOfDate);
+            Assert.Equal("SIMULATED_PUBLIC_BENCHMARK", benchmark.DataProvenance);
+            Assert.All(tools.SearchEcommerceListingsTool(code), candidate => Assert.StartsWith(benchmark.AsOfDate, candidate.CollectedAtKst));
+        }
+    }
+
+    [Fact]
+    public async Task AgentPipeline_TrustedHandoffOverridesForgedModelAuditArgumentsAndFailsClosed()
+    {
+        var engine = new MarketEngineService();
+        var before = engine.CaptureVerificationCheckpoint(Gyul);
+        var tools = new MissingEvidenceTools(engine);
+        using var adapter = new CopilotSdkChatClientAdapter(NullLogger<CopilotSdkChatClientAdapter>.Instance,
+            (_, functions, _) => Task.FromResult<ToolInvocationPlan?>(functions.ContainsKey("audit_quote_invariants")
+                ? new ToolInvocationPlan([new ToolInvocationRequest("audit_quote_invariants", new Dictionary<string, object?>
+                {
+                    ["wholesalePrice"] = 100, ["optimalPrice"] = 12_400, ["retailLowestPrice"] = 99_900,
+                    ["rejectedBaitCount"] = 99, ["adoptedBrix"] = 99, ["targetMinBrix"] = 1,
+                    ["adoptedGrade"] = "로얄과 특등급", ["targetGrade"] = "로얄과 특등급",
+                    ["hasSourceProvenance"] = true, ["adoptedSourceUrl"] = "https://www.coupang.com/forged"
+                })]) : null));
+        var orchestrator = new CopilotAgentOrchestrator(adapter, tools, NullLoggerFactory.Instance);
+        var events = new List<AgentStreamEvent>();
+        await foreach (var item in orchestrator.RunVerificationStreamAsync(new AgentVerifyRequest("감귤 3kg", "BUYER", Gyul)))
+            events.Add(item);
+        Assert.Equal("AUDIT_FAILED", events[^1].Status);
+        Assert.DoesNotContain(events, item => item.Status == "AUDIT_PASSED");
+        Assert.Equal(3, tools.AuditInputs.Count);
+        Assert.All(tools.AuditInputs, input =>
+        {
+            Assert.Equal(9_200, input.Wholesale);
+            Assert.Equal(0, input.Optimal);
+            Assert.Equal(15_800, input.Retail);
+            Assert.Null(input.Brix);
+            Assert.Equal(12, input.TargetBrix);
+            Assert.Equal("로얄과 특등급 가정용", input.Grade);
+            Assert.False(input.HasSource);
+        });
+        AssertVerificationStateEqual(before, engine.CaptureVerificationCheckpoint(Gyul));
+    }
+
+    private sealed class MissingEvidenceTools(MarketEngineService engine) : GamsdaqTools(engine)
+    {
+        public List<(int Wholesale, int Optimal, int Retail, int? Brix, int? TargetBrix, string? Grade, bool HasSource)> AuditInputs { get; } = [];
+
+        public override BaitVerificationSummary VerifyFourGateLowestPriceTool(string tickerCode, List<EcommerceCandidate>? candidates = null)
+        {
+            var result = base.VerifyFourGateLowestPriceTool(tickerCode, candidates);
+            return result with
+            {
+                Candidates = result.Candidates.Select(candidate => candidate.GateCode == "GATE_PASS_LOWEST_ADOPTED"
+                    ? candidate with { GuaranteedBrix = null, GradeText = "로얄과 특등급 가정용", SourceUrl = "" }
+                    : candidate).ToList()
+            };
+        }
+
+        public override OptimalQuoteResult ComputeWinWinOptimalQuoteTool(string tickerCode, int? minimumPrice = null, int? maximumPrice = null) =>
+            base.ComputeWinWinOptimalQuoteTool(tickerCode, minimumPrice, maximumPrice) with { RecommendedOptimalPrice = 0 };
+
+        public override AuditResult AuditQuoteInvariantsTool(int wholesalePrice, int optimalPrice, int retailLowestPrice,
+            int rejectedBaitCount, int? adoptedBrix, int? targetMinBrix, string? adoptedGrade, string? targetGrade,
+            bool hasSourceProvenance, string? adoptedSourceUrl)
+        {
+            AuditInputs.Add((wholesalePrice, optimalPrice, retailLowestPrice, adoptedBrix, targetMinBrix, adoptedGrade, hasSourceProvenance));
+            return base.AuditQuoteInvariantsTool(wholesalePrice, optimalPrice, retailLowestPrice, rejectedBaitCount,
+                adoptedBrix, targetMinBrix, adoptedGrade, targetGrade, hasSourceProvenance, adoptedSourceUrl);
+        }
+    }
+
+    [Fact]
+    public async Task Adapter_TracksNativeSessionToolsEnforcesTrustedArgumentsAndAvoidsReplayingCompletedCall()
+    {
+        int invoked = 0;
+        var function = AIFunctionFactory.Create((int value) => { invoked++; return new { value }; }, "counter");
+        using var adapter = new CopilotSdkChatClientAdapter(NullLogger<CopilotSdkChatClientAdapter>.Instance,
+            sessionResponder: async (config, message, token) =>
+            {
+                if (!message.Prompt.StartsWith("Select bound tools")) return "도구 결과 요약";
+                var nativeTool = Assert.IsAssignableFrom<AIFunction>(Assert.Single(config.Tools!));
+                Assert.Equal(function.JsonSchema.GetRawText(), nativeTool.JsonSchema.GetRawText());
+                await nativeTool.InvokeAsync(new AIFunctionArguments(new Dictionary<string, object?> { ["value"] = 999 }), token);
+                return """{"calls":[{"toolName":"counter","arguments":{"value":999}}]}""";
+            });
+        Assert.Equal("NOT_EXECUTED", adapter.LastToolExecutionMode);
+        var envelope = new AgentHandoffEnvelope("TrustedUpstream", "CounterAgent", "trusted input",
+            new Dictionary<string, object?> { ["value"] = 7 });
+        var response = await adapter.GetResponseAsync([
+            new ChatMessage(ChatRole.User, JsonSerializer.Serialize(envelope, new JsonSerializerOptions(JsonSerializerDefaults.Web)))],
+            new ChatOptions { Tools = [function] });
+        var batch = JsonSerializer.Deserialize<AgentToolBatchResult>(response.Messages.Last().Text,
+            new JsonSerializerOptions(JsonSerializerDefaults.Web))!;
+        Assert.Equal(1, invoked);
+        Assert.Equal(7, Assert.Single(batch.ToolCalls).Result.GetProperty("value").GetInt32());
+        Assert.Equal("COPILOT_SDK_NATIVE_AIFUNCTION", batch.ExecutionMode);
+        Assert.Equal(batch.ExecutionMode, adapter.LastToolExecutionMode);
+        Assert.Contains(adapter.LastToolExecutionMode, CopilotSdkChatClientAdapter.SupportedExecutionModes);
+        Assert.Single(response.Messages.SelectMany(message => message.Contents).OfType<FunctionCallContent>());
+        Assert.Single(response.Messages.SelectMany(message => message.Contents).OfType<FunctionResultContent>());
+    }
+
+    [Fact]
+    public async Task Adapter_NativeRpcCallbacksRetainIsolatedVerificationWorkspaceWithoutCallerExecutionContext()
+    {
+        var engine = new MarketEngineService();
+        Assert.True(Submit(engine, "BUY", 12_300, 40).Success);
+        var before = engine.CaptureVerificationCheckpoint(Gyul);
+        var tools = new NarrowVerificationTools(engine, "reject");
+        using var adapter = new CopilotSdkChatClientAdapter(NullLogger<CopilotSdkChatClientAdapter>.Instance,
+            sessionResponder: async (config, message, token) =>
+            {
+                var verifier = config.Tools!.OfType<AIFunction>().FirstOrDefault(tool => tool.Name == "verify_four_gate_lowest_price");
+                if (message.Prompt.StartsWith("Select bound tools") && verifier is not null)
+                {
+                    Task invocation;
+                    using (ExecutionContext.SuppressFlow())
+                    {
+                        invocation = Task.Run(async () => await verifier.InvokeAsync(
+                            new AIFunctionArguments(new Dictionary<string, object?> { ["tickerCode"] = Bansi }), token));
+                    }
+                    await invocation;
+                    Assert.Equal(12_000, tools.PrunedBook!.Ticker.VerifiedRetailLowestPrice);
+                    AssertVerificationStateEqual(before, engine.CaptureVerificationCheckpoint(Gyul));
+                }
+                return null;
+            });
+        var orchestrator = new CopilotAgentOrchestrator(adapter, tools, NullLoggerFactory.Instance);
+        var events = new List<AgentStreamEvent>();
+        await foreach (var item in orchestrator.RunVerificationStreamAsync(new AgentVerifyRequest("감귤 3kg", "BUYER", Gyul)))
+            events.Add(item);
+        Assert.Equal("COPILOT_SDK_NATIVE_AIFUNCTION", events.Single(item => item.StepId == "STEP-3").ExecutionMode);
+        Assert.Equal("AUDIT_FAILED", events[^1].Status);
+        Assert.Equal(events[^1].ExecutionMode, adapter.LastToolExecutionMode);
+        AssertVerificationStateEqual(before, tools.RestoredWorkspace!);
+        AssertVerificationStateEqual(before, engine.CaptureVerificationCheckpoint(Gyul));
+    }
+
+    [Fact]
     public async Task Adapter_SupportsModelDirectedToolCallingWhenModelPlannerReturnsPlan()
     {
         int invoked = 0;
@@ -878,6 +1049,7 @@ public class GamsdaqEngineTests
         var batch = JsonSerializer.Deserialize<AgentToolBatchResult>(response.Messages.Last().Text,
             new JsonSerializerOptions(JsonSerializerDefaults.Web))!;
         Assert.Equal(expectedMode, batch.ExecutionMode);
+        Assert.Equal(expectedMode, adapter.LastToolExecutionMode);
         Assert.Equal(expectedMode, response.AdditionalProperties!["executionMode"]);
         Assert.Equal(synthesis == "live" ? synthesis : null, batch.CopilotReasoning);
         Assert.Equal(1, invoked);
