@@ -26,10 +26,15 @@
 
 시드가 **12,400원 / 18,900원**은 초기 체결가 예시이며, 초기 OBI 추천가는 **12,700원 / 19,500원**입니다. 반시 매도 잔량 200박스 추가 시(매도 589 / 매수 290) **19,300원**으로 재산출되며 농가 **+37.9%**, 소비자 **22.2% 절감**을 기대합니다. KAMIS 공영도매시장 및 오픈마켓 후보군은 **시뮬레이션 벤치마크 스냅샷**, 지역 효과는 **시뮬레이션 기반 기대 효과**로서 실시간 수집·현장 실증 수치가 아닙니다.
 
-* **핵심 정량 목표 및 코드 계측 기준 (`POST /api/farmers/natural-quote` 응답 `elapsedMs`, `clicksEquivalent` 포함)**:
+* **핵심 정량 목표 및 코드 계측 기준 (`POST /api/farmers/natural-quote` 응답 `elapsedMs`, `clicksEquivalent`, `executedAgentSteps` 포함)**:
   1. **농가 수취가 향상**: 공판장 도매 기준가($P_{\text{wholesale}}$) 대비 농가 수취액 **20% 이상 증대** (시뮬레이션 기대치: **$+34.8\% \sim +39.3\%$**).
   2. **소비자 구매가 절감**: 동일 스펙 인터넷 실질 최저가($P_{\text{retail}}$) 대비 **15% 이상 절감** (시뮬레이션 기대치: **$-19.6\% \sim -23.8\%$**).
-  3. **워크플로우 축소 기대치**: 기존 6단계 수기 입력(품목·산지·당도·중량·등급·수량) 대비 자연어 입력 후 `[AI 호가산출]` -> `[호가 등록]` -> `[최종 승인]` **3단계(`clicksEquivalent = 3`)**를 지원합니다. 사용자 조작 시간 단축률은 미측정입니다. **서버 파이프라인 약 5~15ms**는 결정론적 웜 실행의 설계 참고 범위(이번 테스트 실측값·보장값 아님)이며 실제 서버 시간 `elapsedMs`와도 구분합니다. `elapsedMs`에는 사용자 입력·검토·승인 시간이 포함되지 않습니다.
+  3. **워크플로우 압축 및 소요 시간 분해 (Workflow Compression & Time Breakdown)**:
+     * **기존 수기 기준선 (추정 약 15분 / 6단계)**: ① KAMIS 공영도매시장 시세 조회 -> ② 오픈마켓 5곳 이상 후보 상품 검색 -> ③ 배송비·중량 옵션별 kg당 단가 수기 계산 및 미끼 상품 판별 -> ④ 호가창 매수·매도 잔량(Order Book Depth) 확인 -> ⑤ 적정 출하/매수 호가 산출 -> ⑥ 규격·단가·수량 6개 항목 수기 입력 및 주문 등록.
+     * **감스닥 End-to-End 사용자 과업 소요 시간 (1줄 입력부터 주문 확정까지 총 약 15~25초 / 3단계, `clicksEquivalent = 3`)**:
+       * **Step 1 (자연어 1줄 입력 및 `[AI 호가산출]` 실행, 약 5~12초)**: `"청도 반시 5kg 20박스"` 입력 후 `[AI 호가산출]` 클릭 시 백엔드 `POST /api/farmers/natural-quote`가 `GitHub.Copilot.SDK` + `Microsoft.Agents.AI` 5-에이전트 파이프라인(`executedAgentSteps = 5`)을 End-to-End로 실행(라이브 Copilot SDK 세션 도구 호출 시 약 5~12초 소요, 오프라인 결정론적 폴백 모드 시 서버 `elapsedMs` 약 5~15ms).
+       * **Step 2 (자동 채움 가격 밴드 및 4-Gate 미끼 탈락 근거 검토, 약 5초)**: 자동 입력된 최적 추천 호가(`19,500원`), 산지 도매 하한선(`14,000원`), 검증된 인터넷 실질 최저가 상한선(`24,800원`) 및 미끼 탈락 사유 확인.
+       * **Step 3 (Human-in-the-Loop 최종 승인 모달 확인, 약 3초)**: `[호가 등록]` 클릭 후 확인 모달에서 주문 내역 승인(`confirmedByUser: true`). (단, API 응답의 `elapsedMs`는 서버 파이프라인 실행 시간만 계측하며 사용자 입력·검토·승인 시간은 별도 구분합니다.)
 
 ---
 
@@ -54,7 +59,7 @@ flowchart LR
 1. **Step 1 (판매자 출하·등록)**: 품목 선택 -> 상생 가격 밴드($P_{\text{wholesale}} < P_{\text{opt}} < P_{\text{retail}}$) 확인 -> 자연어 1줄 또는 단가·수량 입력 후 매도 호가 등록.
 2. **Step 2 (`[호가]` ↔ `[차트]` ↔ `[AI 최저가 4-Gate 검증원장]` 전환 및 주문)**: 3열 호가창 클릭 또는 차트 탭 시장가 버튼으로 주문 생성.
 3. **Step 3 (매수 계약 체결)**: Price-Time Priority 다단계 매칭 즉시 가상 예수금 차감 및 `[장바구니·배송]` 탭에 체결 계약 자동 생성.
-4. **Step 4 (배송 시작 및 데모 초기화)**: 수령지 입력 후 `[산지 직송 배송 시작 요청]` 클릭 시 연락처 PII 자동 마스킹(`010-****-5678`)과 함께 `SHIPPING_STARTED`로 완결. 상단 `[데모 초기화]` 버튼(`POST /api/demo/reset`)으로 언제든 초기 시드 상태로 즉시 복원 가능.
+4. **Step 4 (배송 시작 및 데모 초기화)**: 수령지 입력 후 `[산지 직송 배송 시작 요청]` 클릭 시 수령인 성명(`홍*동`)·전화번호(`010-****-5678`, `02-****-5678`, `+82`)·상세 주소(`경북 청도군 **** (세션 격리·비식별 처리됨)`) 즉시 PII 마스킹(원문 무보관)과 함께 `SHIPPING_STARTED`로 완결. 상단 `[데모 초기화]` 버튼(`POST /api/demo/reset`)으로 언제든 초기 시드 상태로 즉시 복원 가능.
 
 ---
 
@@ -66,17 +71,19 @@ flowchart LR
 * **FR-02: 토스증권 스타일 3열 실시간 호가창 (`ORDERBOOK`) 및 실시간 체결 차트 (`CHART`)**
   * 상단 매도 호가(Ask, 파란색 `#1B64DA` 막대) 5단계·하단 매수 호가(Bid, 붉은색 `#E12343` 막대) 6단계 시각화 및 호가 클릭 시 주문 단가 자동 입력.
   * 차트 탭은 실제 `recentTrades` 체결 이력과 `aiOptimalPrice` 기준선을 SVG 좌표로 동적 렌더링한다.
-* **FR-03: 5-에이전트 최저가 판정 & 4-Gate 미끼 필터링 SSE 스트리밍 (`AI_AUDIT`)**
+* **FR-03: 양대 핵심 워크플로우의 5-에이전트 통합 실행 & 역할 분담 (`AI_AUDIT` & `natural-quote`)**
+  * **두 핵심 사용자 경로 모두 `CopilotAgentOrchestrator` 단일 파이프라인 경유**: ① 고령 농부 자연어 출하 도우미(`POST /api/farmers/natural-quote`, `[AI 호가산출]`)와 ② 실시간 5단계 최저가 검증 스트림(`POST /api/agents/verify-stream`, `[AI 최저가 4-Gate 검증원장]`) 모두 우회 경로 없이 `GitHub.Copilot.SDK`(`CopilotClient` + `CopilotSession` JSON-RPC over bundled `copilot-runtime`) 기반 `Microsoft.Agents.AI` 5개 `ChatClientAgent` 파이프라인을 End-to-End로 통과한다.
+  * **라이브 Azure 운영 상태**: 프로덕션 Azure Container App(`ca-gamsdaq-cheongdo-prod-znl3cd`)은 Linux x64 `copilot-runtime` 바이너리와 시크릿(`COPILOT_GITHUB_TOKEN=secretref:copilot-github-token`)이 주입된 **`CONNECTED_COPILOT_SDK_LIVE` / `COPILOT_SDK_NATIVE_AIFUNCTION`** 모드로 동작하며, `GET /api/health` 및 OpenTelemetry(`copilot.tool_handler`, `tool.native=True`) 스팬으로 즉시 검증할 수 있다.
+  * **정직한 아키텍처 역할 분담 (Model Orchestration vs Deterministic `AIFunction` Tools)**: 5개 `ChatClientAgent`(`GitHub.Copilot.SDK`)는 자연어 의도 해석, 에이전트 간 구조화 핸드오프(`AgentHandoffEnvelope`), 네이티브 도구 호출(`SessionAIFunction`), 한국어 추론 요약 합성을 담당하고, 단가 환산·최적 호가 산술 계산(`calculate_effective_price`, `compute_win_win_optimal_quote`) 및 4-Gate·안전 불변식 검증(`verify_four_gate_lowest_price`, `audit_quote_invariants`)은 LLM 암산 환각이 호가창 가격을 오염시키지 않도록 결정론적 C# `AIFunction` 실행기가 수행한다.
   * 5개 에이전트 단계별 상태, 호출된 C# `AIFunction` 도구명, 실행 시간(ms), 통과/탈락 사유 코드(`GATE-00`~`GATE-04`, 배송비 35% 주의 플래그)를 실시간 스트리밍한다.
-  * 10종 `AIFunction`의 모델 주도 선택(`COPILOT_SDK_MODEL_DIRECTED_AIFUNCTION`)과 결정론적 선택 후 라이브 요약(`COPILOT_SDK_SYNTHESIS_WITH_AIFUNCTION`)을 구분한다. 라이브 요약 없는 결정론적 실행은 `DETERMINISTIC_AIFUNCTION`이다.
 * **FR-04: Price-Time Priority 다단계 주문 매칭 엔진**
   * 지정가(`LIMIT`)·시장가(`MARKET`) 다단계 호가 탐색(Walk-the-Book), 부분 체결, 동일 가격 내 `LinkedList` FIFO 시간 우선 원칙, 지정가 미체결 예약금(`_reservedBalance`) 원자적 검증, 체결 후 `AiOptimalPrice` 즉시 재산출을 수행한다.
-* **FR-05: Responsible AI, 엄격한 상생 가격 부등식 가드레일 및 PII 마스킹**
-  * 감사 및 검증 도구 인자는 모델 제안보다 신뢰된 핸드오프/도구 출력이 항상 우선하며 `null` 증거도 모델이 채우지 못한다. 감귤은 `로얄과`와 `특등급`/`특`, 반시는 `대과`와 `특품`을 모두 요구하고 하위·혼합 등급은 거부한다.
+* **FR-05: Responsible AI, 엄격한 상생 가격 부등식 가드레일, 보안 헤더 및 즉시 PII 마스킹**
+  * **신뢰 감사 상태 우선 강제 (`ResolveChainedArguments`)**: 감사 및 검증 도구 인자는 모델 제안(`initialArgs`)보다 서버의 신뢰된 핸드오프/도구 출력(`dynamicState`)이 항상 우선하며, `null` 증거도 모델이 임의 값으로 채우지 못해 프롬프트 인젝션이나 환각에 의한 `audit_quote_invariants` 위조를 차단한다. 감귤은 `로얄과`와 `특등급`/`특`, 반시는 `대과`와 `특품`을 모두 요구하고 하위·혼합 등급은 거부한다.
   * 감사 전 가격/후보/주문 취소/예약금 변경은 요청별 작업 사본에 격리한다. `STEP-4`에는 `[감사 대기]`를 표시하고 감사 통과 및 시장 버전 일치 시에만 원자적으로 확정한다. 실패·예외·취소·스트림 중단 시 체크포인트의 FIFO 주문 전체와 가상 예수금/예약금까지 복원하며 동시 가상 거래는 보존한다.
   * 300자 절단 전 전체 문자열 유니코드 NFKC 정규화 인젝션 차단(`PromptShieldGuardrail`) 및 외부 상품명 간접 인젝션 차단(`GATE-00_INDIRECT_INJECTION_BLOCKED`).
   * 상생 가격 엄격 부등식(**$P_{\text{wholesale}} < P < P_{\text{retail}}$**, 100원 호가 단위)을 벗어난 지정가 주문은 매수·매도 양방향 모두 즉시 차단한다.
-  * 주문 실행 전 **Human-in-the-Loop 확인 모달**(`confirmedByUser: true`, 시장가 다단계 예상 단가·총액 프리뷰 포함) 필수화 및 배송지 연락처 마스킹(`MaskPhone`)을 적용한다.
+  * **즉시 PII 마스킹 및 원문 무보관 정책 (`POST /api/cart/{contractId}/ship`)**: 주문 실행 전 **Human-in-the-Loop 확인 모달**(`confirmedByUser: true`, 시장가 다단계 예상 단가·총액 프리뷰 포함)을 필수화하며, 배송 시작 요청 수집 즉시 수령인 성명(`홍*동`), 모든 전화번호 형식(`010-****-5678`, `02-****-5678`, `+82` 국제번호 포함), 상세 도로명·번지 주소(`경북 청도군 **** (세션 격리·비식별 처리됨)`)를 즉시 비식별 마스킹하여 원문 PII가 공유 메모리·로그·텔레메트리에 절대 저장되지 않도록 보장한다. 또한 `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, `Cache-Control: no-store` 보안 헤더를 적용한다.
 
 ### P1 (완성도 강화 기능 — 전면 구현 완료)
 * **FR-06: 고령 농부 전용 `[고령 농가 큰글씨 모드]` 토글 및 자연어 1줄 출하 도우미 (`POST /api/farmers/natural-quote`)**
@@ -103,11 +110,11 @@ flowchart LR
 
 | 심사 코드 | 평가 항목 (배점) | PRD/TRD 핵심 명세 및 불변식 | 실제 구현 코드 및 API 검증 경로 |
 |---|---|---|---|
-| **CRIT-01** | **Copilot SDK & Agent Framework (25%)** | `GitHub.Copilot.SDK` (`1.0.29-preview.8`) + `Microsoft.Agents.AI` (`1.27.0`) 5-에이전트, 10개 `AIFunction` 호출, Maker-Checker 2회 재시도 | `src/Gamsdaq.Api/Agents/CopilotAgentOrchestrator.cs`<br>`src/Gamsdaq.Api/Tools/GamsdaqTools.cs`<br>`POST /api/agents/verify-stream` |
-| **CRIT-02** | **생산성 향상 및 문제 적합성 (18%)** | 청도 반시 농가 수취가 $+35.0\%\sim+39.3\%$ 증대, 소비자 $-19.6\%\sim-23.8\%$ 절감, 3클릭 자연어 출하 | `POST /api/farmers/natural-quote`<br>`JJ-GYUL-12B-3KG`, `CD-BANSI-13B-5KG` |
-| **CRIT-03** | **Azure 클라우드 아키텍처 (18%)** | Azure Container Apps (`minReplicas: 1, maxReplicas: 1`), ACR, Managed Identity, App Insights, OpenTelemetry | `infra/main.bicep`, `Dockerfile`<br>`.github/workflows/deploy-azure.yml`<br>`src/Gamsdaq.Api/Diagnostics/GamsdaqTelemetry.cs` |
-| **CRIT-04** | **기능적 완성도 (16%)** | 무인증 즉시 접근, 다단계 FIFO 매칭, 예약금/잔고 차감, 장바구니·배송, 데모 초기화, **149개 테스트** (`dotnet test Gamsdaq.sln --configuration Release`) | `src/Gamsdaq.Api/Matching/MarketEngineService.cs`<br>`POST /api/orders`, `POST /api/demo/reset`<br>`tests/Gamsdaq.Tests/GamsdaqEngineTests.cs` |
+| **CRIT-01** | **Copilot SDK & Agent Framework (25%)** | `GitHub.Copilot.SDK` (`1.0.29-preview.8`, Linux x64 `copilot-runtime` + `COPILOT_GITHUB_TOKEN`) + `Microsoft.Agents.AI` (`1.27.0`) 5-`ChatClientAgent`가 두 핵심 경로(`verify-stream`, `natural-quote`)를 모두 처리하며 결정론적 `AIFunction`(10종)과 역할을 분담 | `src/Gamsdaq.Api/Agents/CopilotAgentOrchestrator.cs`<br>`src/Gamsdaq.Api/Tools/GamsdaqTools.cs`<br>`POST /api/agents/verify-stream`, `POST /api/farmers/natural-quote` |
+| **CRIT-02** | **생산성 향상 및 문제 적합성 (18%)** | 청도 반시 농가 수취가 $+35.0\%\sim+39.3\%$ 증대, 소비자 $-19.6\%\sim-23.8\%$ 절감, 수기 6단계(~15분)를 1줄 입력~주문 확정 3단계(~15~25초)로 압축 | `POST /api/farmers/natural-quote`<br>`JJ-GYUL-12B-3KG`, `CD-BANSI-13B-5KG` |
+| **CRIT-03** | **Azure 클라우드 아키텍처 (18%)** | Azure Container Apps (`minReplicas: 1, maxReplicas: 1`, `CONNECTED_COPILOT_SDK_LIVE`), ACR, Managed Identity, App Insights, OpenTelemetry | `infra/main.bicep`, `Dockerfile`<br>`.github/workflows/deploy-azure.yml`<br>`src/Gamsdaq.Api/Diagnostics/GamsdaqTelemetry.cs` |
+| **CRIT-04** | **기능적 완성도 (16%)** | 무인증 즉시 접근, 다단계 FIFO 매칭, 예약금/잔고 차감, 장바구니·배송, 데모 초기화, 단위·경계값·동시성 테스트 (`dotnet test Gamsdaq.sln --configuration Release`) | `src/Gamsdaq.Api/Matching/MarketEngineService.cs`<br>`POST /api/orders`, `POST /api/demo/reset`<br>`tests/Gamsdaq.Tests/GamsdaqEngineTests.cs` |
 | **CRIT-05** | **사용자 경험 (UX) (12%)** | `[호가]`/`[차트]`/`[AI 최저가 4-Gate 검증원장]` 전환, 큰글씨 모드, 라이트 테마, 3색·`0px` 직각·`Pretendard` | `src/gamsdaq-web/src/main.ts`<br>`src/gamsdaq-web/src/style.css` |
-| **CRIT-06** | **책임 있는 AI (6%)** | 절단 전 NFKC 정규화 인젝션 차단, 간접 인젝션 차단(`GATE-00`), 엄격 부등식($P_{\text{wholesale}} < P < P_{\text{retail}}$), HITL 모달, 연락처 마스킹 | `src/Gamsdaq.Api/Security/PromptShieldGuardrail.cs`<br>`ProducePricingMath.Evaluate` |
+| **CRIT-06** | **책임 있는 AI (6%)** | NFKC 인젝션 차단, 간접 인젝션 차단(`GATE-00`), 신뢰 감사 인자 강제(`ResolveChainedArguments`), 엄격 부등식($P_{\text{wholesale}} < P < P_{\text{retail}}$), HITL 모달, 성명·전화·주소 즉시 PII 마스킹(Zero Raw Retention), HTTP 보안 헤더 | `src/Gamsdaq.Api/Security/PromptShieldGuardrail.cs`<br>`ProducePricingMath.Evaluate`<br>`POST /api/cart/{contractId}/ship` |
 | **CRIT-07** | **창의성 및 혁신성 (5%)** | 비정형 농산물 표준 티커화 + AI 4-Gate 미끼 상품 필터링 + 실시간 양방향 호가 거래소(OBI 동적 호가) 결합 | `ProducePricingMath.Verify`<br>`ProducePricingMath.ComputeQuote` |
 

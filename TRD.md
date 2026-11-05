@@ -72,14 +72,18 @@ flowchart LR
     A5 -.->|"RETRY (최대 2회)"| A4
 ```
 
-### 2.1 SDK 버전 및 `CopilotSdkChatClientAdapter` 실행 모드 아키텍처
+### 2.1 SDK 버전, 양대 핵심 워크플로우 통합 및 `CopilotSdkChatClientAdapter` 아키텍처
 * **NuGet 패키지 버전 (`src/Gamsdaq.Api/Gamsdaq.Api.csproj`)**: `GitHub.Copilot.SDK` (`1.0.29-preview.8`), `Microsoft.Agents.AI` (`1.27.0`), `Microsoft.Extensions.AI` (`10.11.0`), `Microsoft.ApplicationInsights.AspNetCore` (`3.2.0`), `OpenTelemetry.Extensions.Hosting` (`1.19.1`).
+* **양대 핵심 사용자 경로의 단일 5-에이전트 파이프라인 통합 (`CopilotAgentOrchestrator`)**:
+  1. **`POST /api/farmers/natural-quote` (`[AI 호가산출]`)**: `CopilotAgentOrchestrator.AnalyzeNaturalSellerInputAsync`가 우회 경로 없이 내부적으로 `RunVerificationStreamAsync`를 호출하여 `SpecNormalizerAgent` -> `PriceDiscoveryAgent` -> `BaitFilterVerifierAgent` -> `OptimalQuoteAdvisorAgent` -> `AuditorGuardrailAgent` 5단계(`executedAgentSteps = 5`)를 End-to-End로 실행합니다.
+  2. **`POST /api/agents/verify-stream` (`실시간 5단계 AI 최저가 검증 SSE`)**: 동일한 5개 `ChatClientAgent`(`Microsoft.Agents.AI`)와 `GitHub.Copilot.SDK`(`CopilotClient` + `CopilotSession` JSON-RPC over bundled `copilot-runtime`) 파이프라인을 실행하며 단계별 도구 호출과 추론 과정을 SSE로 스트리밍합니다.
+* **라이브 Azure 배포 상태 (`ca-gamsdaq-cheongdo-prod-znl3cd`)**: 프로덕션 컨테이너는 Linux x64 `copilot-runtime` 바이너리와 `COPILOT_GITHUB_TOKEN=secretref:copilot-github-token` 시크릿이 구성되어 실시간 **`CONNECTED_COPILOT_SDK_LIVE` / `COPILOT_SDK_NATIVE_AIFUNCTION`** 모드로 동작합니다(`GET /api/health` 및 OpenTelemetry `copilot.tool_handler` / `tool.native=True` 스팬으로 검증 가능).
+* **정직한 아키텍처 역할 분담 (Model Orchestration vs Deterministic `AIFunction` Tools)**:
+  * **모델 오케스트레이션 영역 (`GitHub.Copilot.SDK` + `Microsoft.Agents.AI` 5 `ChatClientAgent`)**: 비정형 농가 자연어 의도 해석, 에이전트 간 구조화 핸드오프(`AgentHandoffEnvelope`), 네이티브 도구 호출(`SessionAIFunction`), 한국어 검증 요약 합성을 수행합니다.
+  * **결정론적 실행기 영역 (C# `AIFunction` Tools)**: 중량·배송비 환산(`calculate_effective_price`), OBI 최적 호가 산출(`compute_win_win_optimal_quote`), 4-Gate 미끼 판정(`verify_four_gate_lowest_price`), 안전 불변식 교차 감사(`audit_quote_invariants`)는 LLM 산술 환각이 호가창 가격을 왜곡하지 못하도록 결정론적 C# 수식 실행기로 분리했습니다.
 * **`CopilotSdkChatClientAdapter : IChatClient, IAsyncDisposable` 동작 메커니즘**:
-  1. **도구 바인딩 에이전트 실행 (`toolExecutionMode: "DETERMINISTIC_AIFUNCTION"`)**: `ChatClientAgent.RunAsync` 호출 시 `ChatOptions.Tools`에 바인딩된 `AIFunction` 목록을 사전 Allowlist로 검증(미바인딩 도구 요청 시 실행 전 `InvalidOperationException` 차단)하고, 각 `AIFunction.InvokeAsync`를 실제 호출하여 표준 `FunctionCallContent`/`FunctionResultContent`와 도구별 실행 시간(`LatencyMs`), 결과 JSON(`AgentToolExecution`)을 반환합니다.
-  2. **라이브 Copilot 세션 연결 (`copilotSessionMode`)**: 바인딩된 도구가 없는 비정형 대화 요청은 `Lazy<CopilotClient>`로 `CreateSessionAsync` -> `SendAndWaitAsync`를 호출하며, 실패 시 가짜 성공 문자열로 위장하지 않고 예외를 투명하게 전파합니다(`GET /api/health`에서 `toolExecutionMode`와 `copilotSessionMode`를 분리 표기).
-  3. **도구 선택과 사후 요약 분리**: 모델이 도구를 선택한 경우만 `COPILOT_SDK_MODEL_DIRECTED_AIFUNCTION`입니다. 결정론적으로 선택한 도구 결과를 SDK가 요약만 한 경우 `COPILOT_SDK_SYNTHESIS_WITH_AIFUNCTION`으로 표시하며, 요약 실패가 모델 주도 선택 여부를 바꾸지 않습니다. 요청 취소는 fallback으로 숨기지 않고 전파합니다.
-  4. **SDK 네이티브 실행 추적**: `BuildSessionConfig`에 전달하는 도구는 `SessionAIFunction : DelegatingAIFunction`으로 래핑됩니다. SDK RPC 콜백도 동일한 신뢰 인자 강제·도구 기록·지연 계측을 거치며 호출 시점의 검증 작업 사본 `ExecutionContext`를 유지합니다. 동시 호출은 요청별 세마포어로 직렬화하고, 네이티브에서 이미 완료한 동일 인자 호출은 반환된 JSON 계획에서 중복 실행하지 않습니다. 결과는 `FunctionCallContent`/`FunctionResultContent`, SSE `ToolCalls`에 포함되며 모드는 `COPILOT_SDK_NATIVE_AIFUNCTION`입니다.
-  5. **health 정합성**: `/api/health.toolExecutionMode`는 어댑터의 `LastToolExecutionMode`를 읽습니다. 실행 전 `NOT_EXECUTED`를 포함한 `supportedExecutionModes`를 반환하며, 전역 최근 실행 모드이므로 개별 요청은 SSE `ExecutionMode`를 기준으로 판단합니다.
+  1. **SDK 네이티브 도구 실행 (`COPILOT_SDK_NATIVE_AIFUNCTION`)**: `BuildSessionConfig`에 전달하는 도구는 `SessionAIFunction : DelegatingAIFunction`으로 래핑되어 `CopilotSession` JSON-RPC 콜백에서 직접 호출됩니다. 신뢰 인자 강제(`ResolveChainedArguments`), 도구 실행 기록, 지연 시간 계측(`copilot.tool_handler`, `tool.native=True`), 작업 사본 `ExecutionContext` 격리를 거치며 요청별 세마포어로 직렬화됩니다.
+  2. **모드 구분 및 폴백 투명성**: 모델이 JSON 계획으로 도구를 선택한 경우 `COPILOT_SDK_MODEL_DIRECTED_AIFUNCTION`, 결정론적 도구 실행 후 라이브 SDK가 요약만 수행한 경우 `COPILOT_SDK_SYNTHESIS_WITH_AIFUNCTION`, 오프라인/무토큰 환경의 결정론적 실행은 `DETERMINISTIC_AIFUNCTION`으로 구분합니다. `/api/health`는 `toolExecutionMode`(`LastToolExecutionMode`), `supportedExecutionModes`, `copilotSessionMode`를 투명하게 노출합니다.
 
 ### 2.2 에이전트별 역할 및 10개 C# `AIFunction` 도구 입출력 스키마
 
@@ -100,20 +104,28 @@ flowchart LR
 * **Maker-Checker 감사 및 재시도 상한 (`maxRetries = 2`)**: `AuditorGuardrailAgent`는 ① 엄격 부등식 **$P_{\text{wholesale}} < P_{\text{opt}} < P_{\text{retail}}$**, ② $P_{\text{opt}} \pmod{100} = 0$, ③ `rejectedBaitCount > 0`을 검증합니다. 위반 시 `AUDIT_RETRY` SSE 이벤트를 방출하고 안전 경계($[P_{\text{wholesale}}+500, P_{\text{retail}}-500]$)를 주입하여 **최대 2회(`maxRetries = 2`)** 재산출합니다. 2회 재시도 후에도 실패하면 `AUDIT_FAILED`를 반환합니다.
 * **프롬프트 인젝션 방어 (`PromptShieldGuardrail.ValidateAndSanitize`)**: 300자 길이 절단 **이전에** 유니코드 `FormKC` 정규화, 제로폭 문자(`\u200B-\u200D\uFEFF`) 제거, 공백·기호 압축(`Compact`)을 수행합니다. **알려진 프롬프트 인젝션 및 비규격 패턴 결정론적 차단 (회귀 테스트 검증)** 범위이며, 300자 뒤 공격 등 등록된 사례를 검증하지만 모든 미지 공격의 차단을 보장하지 않습니다.
 
-### 2.4 지역 근거와 생산성 측정 범위
+### 2.4 지역 근거와 생산성 측정 범위 (Workflow Compression & Time Breakdown)
 * 전체 인구는 **행정안전부 주민등록인구통계·경상북도 청도군**(41.3%는 2023-08 말 보도 인용값), 농가 인구는 **통계청 2020 농림어업총조사·청도군**으로 모집단을 구분합니다. 비용 구조는 **한국농수산식품유통공사(aT) 2023년 농산물 유통실태조사**의 품목·경로별 표본 자료입니다([공식 출처 및 인용 범위](./cheongdo-social-issues.md#3-통계-출처기준시점-및-검증-범위)).
-* **기존 6단계 수기 입력 대비 3단계 워크플로우 축소 기대치**는 UI 설계 비교입니다. **서버 파이프라인 약 5~15ms**는 결정론적 웜 실행의 설계 참고 범위(이번 테스트 실측값·보장값 아님)이며, 실제 서버 실행 시간 `elapsedMs`에는 사용자의 입력·검토·승인 시간이 포함되지 않습니다.
+* **수기 기준선(약 15분 / 6단계) vs 감스닥 End-to-End 과업 시간(약 15~25초 / 3단계) 분해**:
+  * **기존 수기 기준선 (추정 약 15분 / 6단계)**: ① KAMIS 도매시세 조회 -> ② 오픈마켓 5개 이상 상품 검색 -> ③ 배송비·중량 옵션별 단가 수기 환산 -> ④ 호가창 잔량 확인 -> ⑤ 최적 매도/매수가 계산 -> ⑥ 6개 필드 입력 및 주문 제출.
+  * **감스닥 End-to-End 사용자 과업 (총 약 15~25초 / 3단계, `clicksEquivalent = 3`)**:
+    * **Step 1 (~5~12초)**: 자연어 1줄(`"청도 반시 5kg 20박스"`) 입력 후 `[AI 호가산출]` 클릭 시 `POST /api/farmers/natural-quote`가 라이브 `GitHub.Copilot.SDK` 5-에이전트 도구 호출 파이프라인을 실행(라이브 모드 약 5~12초, 오프라인 결정론적 폴백 모드 시 서버 `elapsedMs` 약 10ms).
+    * **Step 2 (~5초)**: 자동 채움된 최적 호가(`19,500원`), 도매 하한선(`14,000원`), 검증 소매 상한선(`24,800원`) 및 4-Gate 미끼 탈락 근거 확인.
+    * **Step 3 (~3초)**: Human-in-the-Loop 최종 승인 모달 확인 및 주문 확정.
 
 ---
 
-## 3. 다단계 Price-Time Priority 호가 매칭 엔진 (`MarketEngineService.cs`)
+## 3. 다단계 Price-Time Priority 호가 매칭 엔진 및 보안·PII 보호 (`MarketEngineService.cs`)
 
 1. **초기 가상 지갑 및 자료구조**: 초기 예수금 `500,000원`(지정가 매수 미체결 예약금 `_reservedBalance` 별도 추적). 가격 레벨별 `SortedDictionary<int, LinkedList<OrderQueueEntry>>`로 가격 우선 및 동일 가격 내 `LinkedList` FIFO 시간 우선 체결(부분 체결 시 최초 `Timestamp` 보존)을 보장하며, `Lock`으로 멀티스레드 원자성을 보장합니다.
 2. **엄격한 상생 가격 부등식 및 원자적 잔고 검증**:
    * `ConfirmedByUser == false` 시 즉시 거부.
    * 지정가(`LIMIT`) 주문은 매수·매도 양방향 모두 엄격 부등식 **$P_{\text{wholesale}} < P < P_{\text{retail}}$**(`JJ-GYUL-12B-3KG`: $9,300\sim 15,700\text{원}$, `CD-BANSI-13B-5KG`: $14,100\sim 24,700\text{원}$), `Price % 100 == 0`, 수량 `1 ~ 1,000`을 강제합니다.
    * 매수(`BUY`) 실행 전 다단계 체결 예상 총액(`projectedCost`) + 미체결 예약금(`reserve`)이 가용 예수금(`_virtualBalance - _reservedBalance`)을 초과하면 부분 체결 없이 전체 주문을 원자적으로 거부합니다.
-3. **Walk-the-Book 체결 및 PII 마스킹**: 매수는 최저 매도가(`askPrice`)부터, 매도는 최고 매수가(`bidPrice`)부터 다단계 체결하며, 항상 **대기 주문의 호가(Resting Order Price)**로 체결됩니다. 배송 시작(`StartShipping`) 시 연락처는 `MaskPhone`(`010-****-5678`)으로 마스킹되어 인메모리에만 보관됩니다.
+3. **Walk-the-Book 체결, 즉시 PII 마스킹(Zero Raw Retention) 및 HTTP 보안 헤더**:
+   * 매수는 최저 매도가(`askPrice`)부터, 매도는 최고 매수가(`bidPrice`)부터 다단계 체결하며, 항상 **대기 주문의 호가(Resting Order Price)**로 체결됩니다.
+   * **즉시 PII 마스킹 및 원문 무보관 정책 (`POST /api/cart/{contractId}/ship`)**: 배송 요청 수집 즉시 수령인 성명(`홍*동`), 모든 전화번호 형식(`010-****-5678`, `02-****-5678`, `+82` 국제번호 포함), 상세 도로명·번지 주소(`경북 청도군 **** (세션 격리·비식별 처리됨)`)를 비식별화하여 원문 PII가 공유 메모리·로그·텔레메트리에 절대 남지 않습니다.
+   * **HTTP 보안 헤더 및 신뢰 감사 상태 강제**: 응답에 `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, `Cache-Control: no-store`를 적용하며, `ResolveChainedArguments`가 프롬프트 인젝션이나 환각에 의한 `audit_quote_invariants` 인자 위조를 원천 차단합니다.
 
 ---
 
@@ -123,14 +135,14 @@ flowchart LR
 
 | 메서드 & 경로 | 상태 코드 | 요청 JSON 예시 | 응답 핵심 필드 |
 |---|---|---|---|
-| `GET /api/health` | `200 OK` | 없음 | `{ "status": "Healthy", "copilotSdk": "GitHub.Copilot.SDK 1.0.29-preview.8", "agentFramework": "Microsoft.Agents.AI 1.27.0", "toolExecutionMode": "DETERMINISTIC_AIFUNCTION", "copilotSessionMode": "LAZY_COPILOT_CLIENT_FALLBACK_READY" }` |
+| `GET /api/health` | `200 OK` | 없음 | `{ "status": "Healthy", "copilotSdk": "GitHub.Copilot.SDK 1.0.29-preview.8", "agentFramework": "Microsoft.Agents.AI 1.27.0", "toolExecutionMode": "COPILOT_SDK_NATIVE_AIFUNCTION", "copilotSessionMode": "CONNECTED_COPILOT_SDK_LIVE" }` |
 | `GET /api/tickers` | `200 OK` | 없음 | `ProduceTicker[]` (`code`, `wholesalePrice`, `verifiedRetailLowestPrice`, `aiOptimalPrice`, `currentPrice`) |
 | `GET /api/tickers/{code}/orderbook` | `200 OK` | 없음 | `OrderBookSnapshot` (`ticker`, `asks`, `bids`, `orderBookImbalance`, `recentTrades`, `verifiedCandidates`) |
-| `POST /api/agents/verify-stream` | `200 OK` (SSE) | `{ "query": "청도 명품 반시 대과 5kg 20박스", "role": "SELLER", "tickerCode": "CD-BANSI-13B-5KG" }` | 단계별 `data: <AgentStreamEvent JSON>\n\n` (`stepId`, `agentName`, `status`, `toolName`, `executionLatencyMs`, `toolCalls`) |
-| `POST /api/farmers/natural-quote` | `200 OK` | `{ "naturalText": "청도 반시 5kg 30박스 좋은 가격에 팔래요" }` | `NaturalSellerQuoteResponse` (`isSafeInput`, `matchedTickerCode`, `recommendedAskPrice`, `elapsedMs`, `clicksEquivalent`) |
+| `POST /api/agents/verify-stream` | `200 OK` (SSE) | `{ "query": "청도 명품 반시 대과 5kg 20박스", "role": "SELLER", "tickerCode": "CD-BANSI-13B-5KG" }` | 단계별 `data: <AgentStreamEvent JSON>\n\n` (`stepId`, `agentName`, `status`, `toolName`, `executionLatencyMs`, `toolCalls`, `executionMode`) |
+| `POST /api/farmers/natural-quote` | `200 OK` | `{ "naturalText": "청도 반시 5kg 30박스 좋은 가격에 팔래요" }` | `NaturalSellerQuoteResponse` (`isSafeInput`, `matchedTickerCode`, `recommendedAskPrice`, `elapsedMs`, `clicksEquivalent`, `executedAgentSteps`) |
 | `POST /api/orders` | `200` / `400` | `{ "tickerCode": "JJ-GYUL-12B-3KG", "side": "BUY", "orderType": "LIMIT", "price": 12400, "quantity": 2, "confirmedByUser": true }` | `SubmitOrderResponse` (`success`, `matchedQuantity`, `restingQuantity`, `executedPrice`, `fills`, `createdContract`) |
 | `GET /api/wallet-and-cart` | `200 OK` | 없음 | `WalletAndCartResponse` (`virtualBalance`, `sellerPendingSettlement`, `totalConsumerSaved`, `totalFarmerExtraEarned`, `cartContracts`) |
-| `POST /api/cart/{contractId}/ship` | `200` / `400` | `{ "recipientName": "김청도", "recipientPhone": "010-1234-5678", "shippingAddress": "경북 청도군 화양읍" }` | `status: "SHIPPING_STARTED"`, `recipientPhone: "010-****-5678"` (마스킹) |
+| `POST /api/cart/{contractId}/ship` | `200` / `400` | `{ "recipientName": "홍길동", "recipientPhone": "010-1234-5678", "shippingAddress": "경북 청도군 화양읍 청화로 123" }` | `status: "SHIPPING_STARTED"`, `recipientName: "홍*동"`, `recipientPhone: "010-****-5678"`, `shippingAddress: "경북 청도군 **** (세션 격리·비식별 처리됨)"` |
 | `POST /api/demo/reset` | `200 OK` | 없음 | 초기 오더북·가상 지갑(`500,000원`)·장바구니 시드 상태 즉시 복원 후 `WalletAndCartResponse` 반환 |
 
 ---

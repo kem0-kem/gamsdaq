@@ -71,9 +71,10 @@
 ## 3. 개발 및 시스템 엔지니어링 수칙 (Coding & Architecture Governance)
 
 ### 3.1 AI & 프레임워크 수칙 (`judgement-criteria.md` #1 - 25%)
-* **MUST**: 백엔드 에이전트 구현 시 **GitHub Copilot SDK (`GitHub.Copilot.SDK`)**와 **Microsoft Agent Framework (`Microsoft.Agents.AI`)**를 핵심 오케스트레이터로 사용해야 한다.
-* **MUST**: 에이전트의 추론 단계, 호출된 Tool 이름, 미끼 상품 필터링 결과는 `POST /api/agents/verify-stream` 엔드포인트를 통해 **실시간 SSE(Server-Sent Events)**로 스트리밍해야 한다.
-* **SHOULD**: Copilot SDK 인증 토큰 미설정 등 로컬/심사 환경 변수가 불완전한 경우에도 심사위원이 전체 멀티 에이전트 파이프라인과 Tool Calling 스트리밍을 끊김 없이 체험할 수 있도록 **Resilient Fallback Mode**를 함께 구현하고 현재 연결 모드를 UI에 투명하게 표시한다.
+* **MUST**: 백엔드 에이전트 구현 시 **GitHub Copilot SDK (`GitHub.Copilot.SDK`)**와 **Microsoft Agent Framework (`Microsoft.Agents.AI`)**를 핵심 오케스트레이터로 사용하며, **`POST /api/farmers/natural-quote` (`AI 호가산출`)**와 **`POST /api/agents/verify-stream` (`실시간 5단계 AI 최저가 검증 SSE`)** 두 핵심 워크플로우 모두 우회 없이 5-`ChatClientAgent` 파이프라인을 통과해야 한다.
+* **MUST**: 모델 오케스트레이션(자연어 의도 해석, `AgentHandoffEnvelope` 핸드오프, `SessionAIFunction` 네이티브 도구 호출, 한국어 추론 합성)과 결정론적 C# `AIFunction` 도구(단가·최적호가 산술 계산 및 4-Gate·불변식 검증)의 역할 경계를 명확히 분리하여 LLM 산술 환각이 호가창 가격을 오염시키지 않도록 해야 한다.
+* **MUST**: 프로덕션 Azure Container App(`ca-gamsdaq-cheongdo-prod-znl3cd`)은 Linux x64 `copilot-runtime`과 `COPILOT_GITHUB_TOKEN` 시크릿을 통해 라이브 **`CONNECTED_COPILOT_SDK_LIVE` / `COPILOT_SDK_NATIVE_AIFUNCTION`** 모드로 동작해야 하며, 에이전트의 추론 단계, 호출된 Tool 이름, 미끼 상품 필터링 결과를 실시간 SSE 및 `/api/health`, OpenTelemetry(`copilot.tool_handler`, `tool.native=True`)로 검증 가능하게 노출해야 한다.
+* **SHOULD**: Copilot SDK 인증 토큰 미설정 등 로컬/오프라인 환경에서도 전체 멀티 에이전트 파이프라인과 Tool Calling 스트리밍을 끊김 없이 체험할 수 있도록 **Resilient Fallback Mode**를 함께 구현하고 현재 연결 모드를 UI에 투명하게 표시한다.
 * **MUST NOT**: 단순 단일 프롬프트 챗봇 형태로 축소하거나 Tool Calling 없이 LLM 텍스트 응답만으로 가격을 계산해서는 안 된다.
 
 ### 3.2 호가 매칭 및 데이터 무결성 수칙 (`judgement-criteria.md` #4 - 16%)
@@ -91,7 +92,7 @@
 * **MUST (프리텐다드 폰트 고정)**: 모든 타이포그래피는 `Pretendard` 폰트로 고정하며 숫자 열은 `tabular-nums`를 적용한다.
 * **MUST NOT (모서리 라운드 금지)**: 모든 사각형 컨테이너, 버튼, 탭, 호가 셀, 모달에 `border-radius`를 넣지 않는다 (`border-radius: 0px` 직각 고정).
 * **MUST NOT (이모지 사용 금지)**: UI 화면, 버튼, 레이블, 에이전트 메시지 어디에도 이모지를 사용하지 않는다.
-* **MUST (Responsible AI)**: 모든 AI 추천 가격과 검증 리포트 영역에 **`AI 검증 (Copilot SDK + MS Agent Framework)` 텍스트 태그**와 **데이터 수집 출처**를 명시해야 하며, 가상 주문 실행 직전 **Human-in-the-Loop 확인 모달**을 거쳐야 한다.
+* **MUST (Responsible AI & Security)**: 모든 AI 추천 가격과 검증 리포트 영역에 **`AI 검증 (Copilot SDK + MS Agent Framework)` 텍스트 태그**와 **데이터 수집 출처**를 명시해야 하며, 가상 주문 실행 직전 **Human-in-the-Loop 확인 모달**을 거쳐야 한다. 배송 요청(`POST /api/cart/{contractId}/ship`) 수집 즉시 수령인 성명(`홍*동`), 전화번호(`010-****-5678`, `02-****-5678`, `+82`), 상세 주소(`경북 청도군 **** (세션 격리·비식별 처리됨)`)를 마스킹하여 원문 PII를 무보관(Zero Raw Retention) 처리하고, HTTP 보안 헤더(`X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, `Cache-Control: no-store`) 및 신뢰 감사 상태 강제(`ResolveChainedArguments`)를 적용해야 한다.
 * **MUST NOT**: 소스 코드, `appsettings.json`, Bicep 파일, Git 히스토리에 API 키나 시크릿 토큰을 평문으로 저장해서는 안 된다.
 
 ### 3.4 Azure 클라우드 배포 수칙 (`judgement-criteria.md` #3 - 18%)

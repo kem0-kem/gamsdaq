@@ -658,13 +658,15 @@ public class MarketEngineService
                 return (false, "수령인 성함과 배송지 주소를 모두 입력해 주세요.", null);
             }
 
-            var maskedPhone = MaskPhone(req.RecipientPhone.Trim());
+            var maskedName = MaskReceiverName(req.RecipientName);
+            var maskedPhone = MaskPhoneNumber(req.RecipientPhone);
+            var maskedAddress = MaskAddress(req.ShippingAddress);
             var updated = _cartContracts[idx] with
             {
                 Status = "SHIPPING_STARTED",
-                RecipientName = req.RecipientName.Trim(),
+                RecipientName = maskedName,
                 RecipientPhone = maskedPhone,
-                ShippingAddress = req.ShippingAddress.Trim(),
+                ShippingAddress = maskedAddress,
                 ShippedAt = DateTime.UtcNow
             };
 
@@ -677,14 +679,55 @@ public class MarketEngineService
         }
     }
 
-    private static string MaskPhone(string phone)
+    public static string MaskPhoneNumber(string? rawPhone)
     {
-        if (string.IsNullOrWhiteSpace(phone)) return "010-****-0000";
-        var digits = new string(phone.Where(char.IsDigit).ToArray());
-        if (digits.Length >= 10)
+        if (string.IsNullOrWhiteSpace(rawPhone)) return "010-****-0000";
+        var trimmed = rawPhone.Trim();
+        var digits = new string(trimmed.Where(char.IsDigit).ToArray());
+        if (trimmed.StartsWith("+82", StringComparison.Ordinal) || (digits.StartsWith("82", StringComparison.Ordinal) && digits.Length >= 11))
+        {
+            digits = "0" + digits[2..];
+        }
+
+        if (digits.StartsWith("02", StringComparison.Ordinal) && digits.Length >= 9)
+        {
+            return $"02-****-{digits[^4..]}";
+        }
+
+        if (digits.Length >= 9)
         {
             return $"{digits[..3]}-****-{digits[^4..]}";
         }
-        return phone;
+
+        if (digits.Length >= 4)
+        {
+            return $"***-****-{digits[^4..]}";
+        }
+
+        return "***-****-****";
+    }
+
+    public static string MaskReceiverName(string? rawName)
+    {
+        if (string.IsNullOrWhiteSpace(rawName)) return "*";
+        var trimmed = rawName.Trim();
+        if (trimmed.Length <= 2)
+        {
+            return $"{trimmed[0]}*";
+        }
+        return $"{trimmed[0]}{new string('*', trimmed.Length - 2)}{trimmed[^1]}";
+    }
+
+    public static string MaskAddress(string? rawAddress)
+    {
+        const string suffix = "**** (세션 격리·비식별 처리됨)";
+        if (string.IsNullOrWhiteSpace(rawAddress)) return suffix;
+        var tokens = rawAddress.Trim().Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        if (tokens.Length >= 2)
+        {
+            return $"{tokens[0]} {tokens[1]} {suffix}";
+        }
+        var prefix = tokens[0].Length > 10 ? tokens[0][..10] : tokens[0];
+        return $"{prefix} {suffix}";
     }
 }

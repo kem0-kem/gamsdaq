@@ -108,8 +108,9 @@ public class GamsdaqEngineTests
         Assert.True(shippingResult.Success);
         Assert.NotNull(shippingResult.UpdatedContract);
         Assert.Equal("SHIPPING_STARTED", shippingResult.UpdatedContract!.Status);
-        Assert.Equal("홍길동", shippingResult.UpdatedContract.RecipientName);
-        Assert.Equal("서울특별시 강남구 테헤란로 123", shippingResult.UpdatedContract.ShippingAddress);
+        Assert.Equal("홍*동", shippingResult.UpdatedContract.RecipientName);
+        Assert.Equal("010-****-5678", shippingResult.UpdatedContract.RecipientPhone);
+        Assert.Equal("서울특별시 강남구 **** (세션 격리·비식별 처리됨)", shippingResult.UpdatedContract.ShippingAddress);
         Assert.NotNull(shippingResult.UpdatedContract.ShippedAt);
     }
 
@@ -734,11 +735,43 @@ public class GamsdaqEngineTests
         Assert.True(order.Success);
         var ship = engine.StartShipping(order.CreatedContract!.ContractId, new ShippingRequest("김청도", "010-9876-5432", "경북 청도군 화양읍"));
         Assert.True(ship.Success);
-        Assert.Equal("010-****-5432", ship.UpdatedContract!.RecipientPhone);
+        Assert.Equal("김*도", ship.UpdatedContract!.RecipientName);
+        Assert.Equal("010-****-5432", ship.UpdatedContract.RecipientPhone);
+        Assert.Equal("경북 청도군 **** (세션 격리·비식별 처리됨)", ship.UpdatedContract.ShippingAddress);
 
         var reset = engine.ResetDemoMarket();
         Assert.Equal(500_000, reset.VirtualBalance);
         Assert.Single(reset.CartContracts);
+    }
+
+    [Theory]
+    [InlineData("02-123-4567", "02-****-4567")]
+    [InlineData("02-1234-5678", "02-****-5678")]
+    [InlineData("+82 10 1234 5678", "010-****-5678")]
+    [InlineData("82-10-9876-5432", "010-****-5432")]
+    [InlineData("01012345678", "010-****-5678")]
+    [InlineData("054-123-4567", "054-****-4567")]
+    [InlineData("1234", "***-****-1234")]
+    [InlineData("abc", "***-****-****")]
+    [InlineData("", "010-****-0000")]
+    public void MarketEngineService_MasksEdgeCasePhoneNumbersAndNeverLeaksRawDigits(string rawPhone, string expectedMasked)
+    {
+        Assert.Equal(expectedMasked, MarketEngineService.MaskPhoneNumber(rawPhone));
+        Assert.Contains("****", MarketEngineService.MaskPhoneNumber(rawPhone));
+    }
+
+    [Theory]
+    [InlineData("홍길동", "홍*동")]
+    [InlineData("김철", "김*")]
+    [InlineData("남궁길동", "남**동")]
+    [InlineData("이", "이*")]
+    public void MarketEngineService_MasksReceiverNameAndDetailedAddressOnIngest(string rawName, string expectedName)
+    {
+        Assert.Equal(expectedName, MarketEngineService.MaskReceiverName(rawName));
+        var maskedAddr = MarketEngineService.MaskAddress("경북 청도군 화양읍 청화로 77");
+        Assert.Equal("경북 청도군 **** (세션 격리·비식별 처리됨)", maskedAddr);
+        Assert.DoesNotContain("화양읍", maskedAddr);
+        Assert.DoesNotContain("77", maskedAddr);
     }
 
     [Fact]
@@ -1469,7 +1502,9 @@ public class GamsdaqEngineTests
         Assert.Contains("minBrix", parsed.DefaultMappedFields!);
         Assert.Contains("grade", parsed.DefaultMappedFields!);
 
-        using var adapter = new CopilotSdkChatClientAdapter(NullLogger<CopilotSdkChatClientAdapter>.Instance);
+        using var adapter = new CopilotSdkChatClientAdapter(
+            NullLogger<CopilotSdkChatClientAdapter>.Instance,
+            copilotSynthesizer: (summary, _) => Task.FromResult<string?>("Copilot SDK 실시간 추론 완료"));
         var orchestrator = new CopilotAgentOrchestrator(adapter, tools, NullLoggerFactory.Instance);
         var sellerQuote = await orchestrator.AnalyzeNaturalSellerInputAsync("청도 명품 반시 대과 5kg 스무 상자");
         Assert.True(sellerQuote.IsSafeInput);
@@ -1477,6 +1512,16 @@ public class GamsdaqEngineTests
         Assert.Equal(20, sellerQuote.ExtractedQuantity);
         Assert.Equal(3, sellerQuote.ClicksEquivalent);
         Assert.Equal(5, sellerQuote.ExecutedAgentsCount);
+        Assert.Equal("COPILOT_SDK_SYNTHESIS_WITH_AIFUNCTION", sellerQuote.ExecutionMode);
+        Assert.Equal("CONNECTED_COPILOT_SDK_LIVE", sellerQuote.CopilotSessionMode);
+        Assert.Equal(new[] { "SpecNormalizerAgent", "PriceDiscoveryAgent", "BaitFilterVerifierAgent",
+            "OptimalQuoteAdvisorAgent", "AuditorGuardrailAgent" }, sellerQuote.ExecutedAgents);
+        Assert.Contains("parse_produce_spec", sellerQuote.ExecutedTools!);
+        Assert.Contains("verify_four_gate_lowest_price", sellerQuote.ExecutedTools!);
+        Assert.Contains("compute_win_win_optimal_quote", sellerQuote.ExecutedTools!);
+        Assert.Contains("audit_quote_invariants", sellerQuote.ExecutedTools!);
+        Assert.StartsWith("AUDIT_PASSED:", sellerQuote.AuditVerdict);
+        Assert.Contains("Copilot SDK 실시간 추론 완료", sellerQuote.ReasoningSummary);
     }
 
     [Theory]

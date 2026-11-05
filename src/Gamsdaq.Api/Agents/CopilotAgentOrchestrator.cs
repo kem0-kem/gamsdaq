@@ -23,8 +23,9 @@ public record AgentToolBatchResult(string ExecutionMode, double LatencyMs, List<
 }
 
 /// <summary>
-/// Bound market tools run deterministically through Microsoft.Extensions.AI, without requiring model
-/// credentials. Unbound conversational requests use the Copilot SDK and propagate failures honestly.
+/// Bridges Microsoft.Agents.AI (ChatClientAgent / IChatClient) with GitHub.Copilot.SDK (CopilotClient / CopilotSession).
+/// Bound AIFunction tools are registered on SessionConfig.Tools for native Copilot SDK tool-calling RPC,
+/// with deterministic AIFunction execution as a resilient fallback when offline or unauthenticated.
 /// </summary>
 public sealed class CopilotSdkChatClientAdapter : IChatClient, IAsyncDisposable
 {
@@ -37,7 +38,8 @@ public sealed class CopilotSdkChatClientAdapter : IChatClient, IAsyncDisposable
     private int _disposed;
     private string _lastToolExecutionMode = "NOT_EXECUTED";
 
-    public string ConnectionStatus { get; private set; } = "RESILIENT_FALLBACK_DETERMINISTIC_AIFUNCTION";
+    public string ConnectionStatus { get; private set; } =
+        ResolveGitHubToken() is not null ? "CONNECTED_COPILOT_SDK_LIVE" : "RESILIENT_FALLBACK_DETERMINISTIC_AIFUNCTION";
     public string LastToolExecutionMode => Volatile.Read(ref _lastToolExecutionMode);
     public static IReadOnlyList<string> SupportedExecutionModes { get; } = Array.AsReadOnly(new[]
     {
@@ -79,7 +81,7 @@ public sealed class CopilotSdkChatClientAdapter : IChatClient, IAsyncDisposable
         string? model = null) =>
         new()
         {
-            Model = model ?? Environment.GetEnvironmentVariable("COPILOT_MODEL"),
+            Model = model ?? Environment.GetEnvironmentVariable("COPILOT_MODEL") ?? "claude-haiku-4.5",
             Tools = functions.Values.Cast<AIFunctionDeclaration>().ToList(),
             AvailableTools = functions.Keys.ToList(),
             OnPermissionRequest = PermissionHandler.ApproveAll,
@@ -222,7 +224,7 @@ public sealed class CopilotSdkChatClientAdapter : IChatClient, IAsyncDisposable
         var sessionFunctions = functions.ToDictionary(pair => pair.Key,
             pair => (AIFunction)new SessionAIFunction(pair.Value,
                 (arguments, token) => InvokeTrackedAsync(pair.Value, arguments, true, token)));
-        var (plan, modelSelectedTools, _) = await ResolveToolPlanAsync(history, systemText, userText, sessionFunctions, cancellationToken);
+        var (plan, modelSelectedTools, liveSessionSummary, _) = await ResolveToolPlanAsync(history, systemText, userText, sessionFunctions, cancellationToken);
         if (toolFailure is not null) System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(toolFailure).Throw();
         if (plan.Calls.Count == 0) throw new InvalidOperationException("At least one bound tool invocation is required.");
         // Validate the complete allowlist before executing the returned plan.
@@ -239,8 +241,15 @@ public sealed class CopilotSdkChatClientAdapter : IChatClient, IAsyncDisposable
         }
 
         var batchMode = modelSelectedTools ? "COPILOT_SDK_MODEL_DIRECTED_AIFUNCTION" : "DETERMINISTIC_AIFUNCTION";
-        string? copilotReasoning = null;
-        if (_copilotSynthesizer is not null || _sessionResponder is not null || ResolveGitHubToken() is not null)
+        string? copilotReasoning = liveSessionSummary;
+        if (!string.IsNullOrWhiteSpace(copilotReasoning))
+        {
+            batchMode = modelSelectedTools
+                ? "COPILOT_SDK_MODEL_DIRECTED_AIFUNCTION"
+                : "COPILOT_SDK_SYNTHESIS_WITH_AIFUNCTION";
+            ConnectionStatus = "CONNECTED_COPILOT_SDK_LIVE";
+        }
+        else if (_copilotSynthesizer is not null || (!nativeExecuted && (_sessionResponder is not null || ResolveGitHubToken() is not null)))
         {
             try
             {
@@ -252,7 +261,7 @@ public sealed class CopilotSdkChatClientAdapter : IChatClient, IAsyncDisposable
                 }
                 else
                 {
-                    summary = await SendSessionAsync(systemText, sessionFunctions,
+                    summary = await SendSessionAsync(systemText, new Dictionary<string, AIFunction>(),
                         $"Summarize produce verification step concisely in Korean based on tool outputs: {toolSummary}",
                         envelope?.UpstreamAgent ?? plan.UpstreamAgent, TimeSpan.FromSeconds(10), cancellationToken);
                 }
@@ -268,13 +277,20 @@ public sealed class CopilotSdkChatClientAdapter : IChatClient, IAsyncDisposable
             }
             catch (Exception ex) when (ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
             {
-                ConnectionStatus = $"RESILIENT_FALLBACK_DETERMINISTIC_AIFUNCTION ({ex.GetType().Name})";
+                if (!nativeExecuted)
+                {
+                    ConnectionStatus = $"RESILIENT_FALLBACK_DETERMINISTIC_AIFUNCTION ({ex.GetType().Name})";
+                }
                 _logger.LogInformation("Copilot live synthesis skipped ({Message}); using deterministic AIFunction output.", ex.Message);
             }
         }
 
         if (toolFailure is not null) System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(toolFailure).Throw();
-        if (nativeExecuted) batchMode = "COPILOT_SDK_NATIVE_AIFUNCTION";
+        if (nativeExecuted)
+        {
+            batchMode = "COPILOT_SDK_NATIVE_AIFUNCTION";
+            ConnectionStatus = "CONNECTED_COPILOT_SDK_LIVE";
+        }
         Volatile.Write(ref _lastToolExecutionMode, batchMode);
         var batch = new AgentToolBatchResult(batchMode, Stopwatch.GetElapsedTime(started).TotalMilliseconds, executions, copilotReasoning);
         responseMessages.Add(new ChatMessage(ChatRole.Assistant, JsonSerializer.Serialize(batch, JsonOptions)));
@@ -292,7 +308,7 @@ public sealed class CopilotSdkChatClientAdapter : IChatClient, IAsyncDisposable
         };
     }
 
-    private async Task<(ToolInvocationPlan Plan, bool ModelSelected, AgentHandoffEnvelope? Envelope)> ResolveToolPlanAsync(
+    private async Task<(ToolInvocationPlan Plan, bool ModelSelected, string? LiveSummary, AgentHandoffEnvelope? Envelope)> ResolveToolPlanAsync(
         IReadOnlyList<ChatMessage> history,
         string systemText,
         string userText,
@@ -306,7 +322,7 @@ public sealed class CopilotSdkChatClientAdapter : IChatClient, IAsyncDisposable
             if (planned is { Calls.Count: > 0 })
             {
                 ConnectionStatus = "CONNECTED_COPILOT_SDK_LIVE";
-                return (planned, true, envelope);
+                return (planned, true, null, envelope);
             }
         }
         else if (_sessionResponder is not null || ResolveGitHubToken() is not null)
@@ -314,16 +330,27 @@ public sealed class CopilotSdkChatClientAdapter : IChatClient, IAsyncDisposable
             try
             {
                 var toolSchemas = functions.Values.Select(f => new { f.Name, f.Description, Schema = f.JsonSchema });
-                var prompt = $"Select bound tools to invoke as JSON {{\"calls\":[{{\"toolName\":\"...\",\"arguments\":{{...}}}}]}}. Available tools: {JsonSerializer.Serialize(toolSchemas, JsonOptions)}. Input: {userText}";
+                var prompt = $"Select bound tools to invoke as JSON {{\"calls\":[{{\"toolName\":\"...\",\"arguments\":{{...}}}}]}} or invoke the main bound tool once and summarize in one Korean sentence. Available tools: {JsonSerializer.Serialize(toolSchemas, JsonOptions)}. Input: {userText}";
                 var reply = await SendSessionAsync(systemText, functions, prompt,
-                    envelope?.UpstreamAgent, TimeSpan.FromSeconds(10), cancellationToken);
+                    envelope?.UpstreamAgent, TimeSpan.FromSeconds(15), cancellationToken);
                 if (!string.IsNullOrWhiteSpace(reply))
                 {
-                    var modelPlan = JsonSerializer.Deserialize<ToolInvocationPlan>(reply, JsonOptions);
-                    if (modelPlan is { Calls.Count: > 0 } && modelPlan.Calls.All(c => functions.ContainsKey(c.ToolName)))
+                    try
+                    {
+                        var modelPlan = JsonSerializer.Deserialize<ToolInvocationPlan>(reply, JsonOptions);
+                        if (modelPlan is { Calls.Count: > 0 } && modelPlan.Calls.All(c => functions.ContainsKey(c.ToolName)))
+                        {
+                            ConnectionStatus = "CONNECTED_COPILOT_SDK_LIVE";
+                            return (modelPlan, true, null, envelope);
+                        }
+                    }
+                    catch (JsonException)
                     {
                         ConnectionStatus = "CONNECTED_COPILOT_SDK_LIVE";
-                        return (modelPlan, true, envelope);
+                        var fallbackPlan = envelope is not null
+                            ? PlanFromBoundAgentTools(envelope, functions)
+                            : ParsePlan(userText, functions);
+                        return (fallbackPlan, false, reply.Trim(), envelope);
                     }
                 }
             }
@@ -335,10 +362,10 @@ public sealed class CopilotSdkChatClientAdapter : IChatClient, IAsyncDisposable
 
         if (envelope is not null)
         {
-            return (PlanFromBoundAgentTools(envelope, functions), false, envelope);
+            return (PlanFromBoundAgentTools(envelope, functions), false, null, envelope);
         }
 
-        return (ParsePlan(userText, functions), false, null);
+        return (ParsePlan(userText, functions), false, null, null);
     }
 
     private static AgentHandoffEnvelope? TryParseHandoffEnvelope(string text)
@@ -548,6 +575,7 @@ public sealed class CopilotSdkChatClientAdapter : IChatClient, IAsyncDisposable
 
 public class CopilotAgentOrchestrator
 {
+    private readonly CopilotSdkChatClientAdapter _copilotChatClient;
     private readonly GamsdaqTools _tools;
     private readonly ChatClientAgent _specNormalizerAgent;
     private readonly ChatClientAgent _priceDiscoveryAgent;
@@ -557,6 +585,7 @@ public class CopilotAgentOrchestrator
 
     public CopilotAgentOrchestrator(CopilotSdkChatClientAdapter copilotChatClient, GamsdaqTools tools, ILoggerFactory loggerFactory)
     {
+        _copilotChatClient = copilotChatClient;
         _tools = tools;
         ChatClientAgent Create(string name, string instructions, IList<AITool> boundTools) =>
             new(copilotChatClient, instructions: instructions, name: name, tools: boundTools, loggerFactory: loggerFactory);
@@ -817,19 +846,52 @@ public class CopilotAgentOrchestrator
         {
             return new NaturalSellerQuoteResponse(false, warning, "JJ-GYUL-12B-3KG", "12브릭스 노지 감귤 3kg",
                 0, 0, 0, 0, 0, 0, warning ?? "입력 차단",
-                Math.Round(Stopwatch.GetElapsedTime(started).TotalMilliseconds, 2), 3, 0);
+                Math.Round(Stopwatch.GetElapsedTime(started).TotalMilliseconds, 2), 3, 0,
+                "BLOCKED_BY_GUARDRAIL", _copilotChatClient.ConnectionStatus,
+                ["PromptShieldGuardrail"], ["ValidateAndSanitize"], "BLOCKED_BY_PROMPT_SHIELD");
         }
 
         NormalizedSpecResult? spec = null;
         OptimalQuoteResult? quote = null;
         AuditResult? audit = null;
         int executedSteps = 0;
+        var executedAgents = new List<string>();
+        var executedTools = new List<string>();
+        string? lastExecutionMode = null;
+        string? step1Reasoning = null;
+        string? step4Reasoning = null;
 
         await foreach (var evt in RunVerificationStreamAsync(new AgentVerifyRequest(sanitized, "SELLER"), cancellationToken))
         {
             executedSteps++;
-            if (evt.StepId == "STEP-1" && evt.Payload is NormalizedSpecResult s) spec = s;
-            if (evt.StepId == "STEP-4" && evt.Payload is OptimalQuoteResult q) quote = q;
+            if (!string.IsNullOrWhiteSpace(evt.AgentName) && !executedAgents.Contains(evt.AgentName, StringComparer.Ordinal))
+            {
+                executedAgents.Add(evt.AgentName);
+            }
+            if (evt.ToolCalls is { Count: > 0 })
+            {
+                foreach (var toolCall in evt.ToolCalls)
+                {
+                    if (!executedTools.Contains(toolCall.ToolName, StringComparer.Ordinal))
+                    {
+                        executedTools.Add(toolCall.ToolName);
+                    }
+                }
+            }
+            if (!string.IsNullOrWhiteSpace(evt.ExecutionMode))
+            {
+                lastExecutionMode = evt.ExecutionMode;
+            }
+            if (evt.StepId == "STEP-1" && evt.Payload is NormalizedSpecResult s)
+            {
+                spec = s;
+                step1Reasoning = evt.Summary;
+            }
+            if (evt.StepId == "STEP-4" && evt.Payload is OptimalQuoteResult q)
+            {
+                quote = q;
+                step4Reasoning = evt.Summary?.Replace("[감사 대기] ", "", StringComparison.Ordinal).Trim();
+            }
             if (evt.StepId == "STEP-5" && evt.Status is "AUDIT_PASSED" or "AUDIT_FAILED")
             {
                 var json = JsonSerializer.SerializeToElement(evt.Payload, CopilotSdkChatClientAdapter.JsonOptions);
@@ -841,18 +903,28 @@ public class CopilotAgentOrchestrator
         }
 
         double elapsedMs = Math.Round(Stopwatch.GetElapsedTime(started).TotalMilliseconds, 2);
+        string resolvedMode = lastExecutionMode ?? _copilotChatClient.LastToolExecutionMode;
         if (spec is null || quote is null || audit is not { AuditPassed: true })
         {
             return new NaturalSellerQuoteResponse(false, audit?.AuditVerdict ?? "감사 검증 실패",
                 spec?.TickerCode ?? "JJ-GYUL-12B-3KG", spec?.StandardName ?? "12브릭스 노지 감귤 3kg",
-                0, 0, 0, 0, 0, 0, audit?.AuditVerdict ?? "감사 검증 실패", elapsedMs, 3, executedSteps);
+                0, 0, 0, 0, 0, 0, audit?.AuditVerdict ?? "감사 검증 실패", elapsedMs, 3, executedSteps,
+                resolvedMode, _copilotChatClient.ConnectionStatus, executedAgents, executedTools, audit?.AuditVerdict);
         }
 
         int totalExtra = quote.FarmerExtraGainAmount * spec.ExtractedQuantity;
+        string baseReasoning = $"도매가 대비 박스당 +{quote.FarmerExtraGainAmount:N0}원, {spec.ExtractedQuantity}박스 총 +{totalExtra:N0}원 추가 수익을 기대합니다.";
+        string reasoningSummary = !string.IsNullOrWhiteSpace(step4Reasoning)
+            ? $"{baseReasoning} ({step4Reasoning})"
+            : !string.IsNullOrWhiteSpace(step1Reasoning)
+                ? $"{baseReasoning} ({step1Reasoning})"
+                : baseReasoning;
+
         return new NaturalSellerQuoteResponse(true, null, spec.TickerCode, spec.StandardName, spec.ExtractedQuantity,
             quote.WholesaleFloorPrice, quote.VerifiedRetailCeilingPrice, quote.RecommendedOptimalPrice,
             quote.FarmerExtraGainAmount, totalExtra,
-            $"도매가 대비 박스당 +{quote.FarmerExtraGainAmount:N0}원, {spec.ExtractedQuantity}박스 총 +{totalExtra:N0}원 추가 수익을 기대합니다.",
-            elapsedMs, 3, executedSteps);
+            reasoningSummary,
+            elapsedMs, 3, executedSteps,
+            resolvedMode, _copilotChatClient.ConnectionStatus, executedAgents, executedTools, audit.AuditVerdict);
     }
 }

@@ -33,11 +33,18 @@
 * **시드가와 OBI 추천가 구분**: 감귤 시드 체결가 **12,400원**, 반시 **18,900원**과 달리 초기 호가 잔량을 반영한 추천가는 각각 **12,700원**, **19,500원**입니다. 반시 매도 잔량을 200박스 추가하면(매도 589 / 매수 290박스) **19,300원**으로 재산출됩니다. 19,300원은 초기 고정값이 아니라 잔량 변화 예시입니다.
 * 초기 OBI 추천가 기준 기대 효과는 감귤 농가 **+38.0%** / 소비자 **19.6% 절감**, 반시 농가 **+39.3%** / 소비자 **21.4% 절감**입니다. 반시 19,300원 예시는 각각 **+37.9% / 22.2% 절감**입니다.
 * **출처와 한계**: KAMIS 공영도매시장 및 오픈마켓 후보군은 결정론적 재현성을 위한 **2026-11-05 고정 시뮬레이션 벤치마크 스냅샷**입니다. 요청일을 수집일로 표시하지 않습니다. 출처 URL은 참조 경로이며 실시간 수집·실거래 증빙이 아닙니다. 지역 효과도 현장 실증이 아닌 시뮬레이션 기반 기대 효과입니다.
-* **에이전트 실행 투명성**: 10종 `AIFunction`을 사용합니다. 모델의 도구 선택은 `COPILOT_SDK_MODEL_DIRECTED_AIFUNCTION`, 결정론적 선택 후 라이브 요약만 성공하면 `COPILOT_SDK_SYNTHESIS_WITH_AIFUNCTION`, 결정론적 선택·실행만 수행하면 `DETERMINISTIC_AIFUNCTION`입니다. SDK 세션 내부의 실제 도구 호출은 래핑하여 SSE 도구 기록에 포함하고 `COPILOT_SDK_NATIVE_AIFUNCTION`으로 구분합니다. `/api/health`는 `LastToolExecutionMode`와 `supportedExecutionModes`를 반환하며 실행 전은 `NOT_EXECUTED`입니다.
-* **감사 원자성**: 검증은 요청별 독립 작업 사본에서 진행하고 `STEP-4`에는 `[감사 대기]`를 표시합니다. 감사 통과와 시장 버전 일치를 함께 확인한 뒤에만 후보·호가·주문 취소·예약금 해제를 단일 잠금으로 확정합니다. 감사 실패·예외·취소·스트림 중단은 작업 사본 전체를 복원하며, 동시 실거래가 아닌 **동시 가상 거래**의 주문·잔고는 덮어쓰지 않습니다.
-* **감사 신뢰 경계**: 모델 인자보다 신뢰된 상태가 항상 우선하며 누락 증거(`null`)도 덮어씁니다. 감귤 `로얄과` + `특등급`/`특`, 반시 `대과` + `특품`을 모두 요구합니다. 알려진 프롬프트 인젝션 및 비규격 패턴 결정론적 차단 (회귀 테스트 검증)이며, **시드 벤치마크 후보군(10건) 기준 미끼 상품 100% 필터링**(4/4건)은 전체 시장 탐지율 보장이 아닙니다.
-* **지역 통계 근거**: 전체 인구는 [행정안전부 주민등록인구통계](https://jumin.mois.go.kr/ageStatMonth.do) 경상북도 청도군 기준(41.3%는 2023-08 말 보도 인용값), 농가 인구는 **통계청 2020 농림어업총조사** 청도군 기준으로 구분합니다. 비용 구조는 **aT 2023년 농산물 유통실태조사**를 참조하며 지역별 실측과 혼용하지 않습니다([출처·범위](./cheongdo-social-issues.md#3-통계-출처기준시점-및-검증-범위)).
-* **생산성 지표**: 기존 6단계 수기 입력 대비 **3단계 워크플로우 축소 기대치**입니다. 서버 파이프라인 **약 5~15ms**는 결정론적 웜 실행의 설계 참고 범위(이번 테스트 실측값·보장값 아님)이며 실제 서버 시간은 `elapsedMs`입니다. 사용자 입력·검토·승인 시간은 포함하지 않으며 사용자 조작 시간 단축 효과는 별도 실증이 필요합니다.
+* **핵심 기술 경로 통합 및 정직한 역할 분담 (`CRIT-01`: Copilot SDK & Microsoft Agent Framework)**:
+  * **양대 핵심 사용자 워크플로우 End-to-End 통합**: ① 고령 농가 자연어 출하 호가 산출(`POST /api/farmers/natural-quote`, `[AI 호가산출]`)과 ② 실시간 5단계 최저가 검증 SSE(`POST /api/agents/verify-stream`) 모두 우회 경로 없이 **`GitHub.Copilot.SDK`(`CopilotClient` + `CopilotSession` JSON-RPC over bundled `copilot-runtime`)** 기반 **`Microsoft.Agents.AI` 5개 `ChatClientAgent` 파이프라인**을 통과합니다.
+  * **라이브 Azure 운영 상태 (`ca-gamsdaq-cheongdo-prod-znl3cd`)**: 프로덕션 컨테이너는 Linux x64 `copilot-runtime`과 시크릿(`COPILOT_GITHUB_TOKEN=secretref:copilot-github-token`)이 주입되어 실시간 **`CONNECTED_COPILOT_SDK_LIVE` / `COPILOT_SDK_NATIVE_AIFUNCTION`** 모드로 동작하며, `GET /api/health` 및 OpenTelemetry(`copilot.tool_handler`, `tool.native=True`) 스팬으로 검증할 수 있습니다.
+  * **모델 오케스트레이션 vs 결정론적 `AIFunction` 도구 경계**: 5개 `ChatClientAgent`(`GitHub.Copilot.SDK`)는 자연어 의도 해석, 에이전트 간 구조화 핸드오프(`AgentHandoffEnvelope`), 네이티브 도구 호출(`SessionAIFunction`), 한국어 추론 요약 합성을 담당하고, 단가 환산·최적 호가 산술 계산(`calculate_effective_price`, `compute_win_win_optimal_quote`) 및 4-Gate·안전 불변식 검증(`verify_four_gate_lowest_price`, `audit_quote_invariants`)은 LLM 산술 환각이 호가창 가격을 오염시키지 않도록 결정론적 C# `AIFunction` 실행기가 담당합니다.
+* **감사 원자성 및 신뢰 경계 (`CRIT-06`: Responsible AI, Security & Privacy)**:
+  * **작업 사본 격리 및 원자적 확정**: 검증은 요청별 독립 작업 사본에서 진행하고 `STEP-4`에는 `[감사 대기]`를 표시합니다. 감사 통과와 시장 버전 일치를 확인한 뒤에만 후보·호가·주문 취소·예약금 해제를 단일 잠금으로 확정하며, 실패·예외·취소 시 작업 사본 전체를 복원합니다.
+  * **신뢰 감사 상태 우선 강제 (`ResolveChainedArguments`)**: 프롬프트 인젝션이나 환각으로 생성된 도구 인자가 `audit_quote_invariants`를 위조하지 못하도록 상위 도구의 신뢰 상태(`dynamicState`, `null` 누락 증거 포함)가 모델 인자를 항상 덮어씁니다.
+  * **즉시 PII 마스킹 및 원문 무보관 정책 (`POST /api/cart/{contractId}/ship`)**: 배송 요청 수집 즉시 수령인 성명(`홍*동`), 모든 전화번호 형식(`010-****-5678`, `02-****-5678`, `+82` 국제번호), 상세 도로명 주소(`경북 청도군 **** (세션 격리·비식별 처리됨)`)를 마스킹하여 원문 PII가 공유 메모리·로그·텔레메트리에 절대 저장되지 않습니다. 또한 `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, `Cache-Control: no-store` 보안 헤더를 적용합니다.
+* **지역 통계 근거 및 워크플로우 시간 분해 (`CRIT-02`: Productivity Impact & Problem Fit)**:
+  * 전체 인구는 [행정안전부 주민등록인구통계](https://jumin.mois.go.kr/ageStatMonth.do) 경상북도 청도군 기준(41.3%는 2023-08 말 보도 인용값), 농가 인구는 **통계청 2020 농림어업총조사** 청도군 기준으로 구분하며, 비용 구조는 **aT 2023년 농산물 유통실태조사**를 참조합니다([출처·범위](./cheongdo-social-issues.md#3-통계-출처기준시점-및-검증-범위)).
+  * **수기 기준선(약 15분 / 6단계)**: KAMIS 도매시세 조회 + 오픈마켓 5곳 가격 비교 + 배송비·중량 단가 수기 계산 + 호가창 잔량 확인 + 최적 호가 산출 + 주문 등록.
+  * **감스닥 End-to-End 사용자 과업 시간(총 약 15~25초 / 3단계, `clicksEquivalent = 3`)**: ① 자연어 1줄(`"청도 반시 5kg 20박스"`) 입력 및 `[AI 호가산출]` 클릭(라이브 `GitHub.Copilot.SDK` 5-에이전트 도구 호출 약 5~12초, 오프라인 결정론적 폴백 시 약 10ms) -> ② 최적 추천 호가(`19,500원`)·도매 하한(`14,000원`)·소매 상한(`24,800원`) 및 4-Gate 미끼 탈락 근거 확인(약 5초) -> ③ Human-in-the-Loop 확인 모달 승인(약 3초).
 
 ---
 

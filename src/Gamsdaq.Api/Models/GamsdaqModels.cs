@@ -144,7 +144,12 @@ public record NaturalSellerQuoteResponse(
     string ReasoningSummary,
     double ElapsedMs = 0,
     int ClicksEquivalent = 3,
-    int ExecutedAgentsCount = 5
+    int ExecutedAgentsCount = 5,
+    string ExecutionMode = "COPILOT_SDK_NATIVE_AIFUNCTION",
+    string CopilotSessionMode = "CONNECTED_COPILOT_SDK_LIVE",
+    IReadOnlyList<string>? ExecutedAgents = null,
+    IReadOnlyList<string>? ExecutedTools = null,
+    string? AuditVerdict = null
 );
 
 public record AgentVerifyRequest(

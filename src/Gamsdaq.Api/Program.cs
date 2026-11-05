@@ -1,9 +1,11 @@
 using System.Text.Json;
+using System.Threading.RateLimiting;
 using Gamsdaq.Api.Agents;
 using Gamsdaq.Api.Diagnostics;
 using Gamsdaq.Api.Matching;
 using Gamsdaq.Api.Models;
 using Gamsdaq.Api.Tools;
+using Microsoft.AspNetCore.RateLimiting;
 using OpenTelemetry.Metrics;
 using OpenTelemetry.Trace;
 
@@ -24,6 +26,20 @@ builder.Services.AddCors(options =>
     options.AddDefaultPolicy(policy =>
         policy.AllowAnyOrigin().AllowAnyHeader().AllowAnyMethod());
 });
+builder.Services.AddRateLimiter(options =>
+{
+    options.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
+    options.GlobalLimiter = PartitionedRateLimiter.Create<HttpContext, string>(httpContext =>
+        RateLimitPartition.GetFixedWindowLimiter(
+            partitionKey: httpContext.Connection.RemoteIpAddress?.ToString() ?? "global",
+            factory: _ => new FixedWindowRateLimiterOptions
+            {
+                PermitLimit = 120,
+                Window = TimeSpan.FromMinutes(1),
+                QueueProcessingOrder = QueueProcessingOrder.OldestFirst,
+                QueueLimit = 20
+            }));
+});
 
 builder.Services.AddSingleton<MarketEngineService>();
 builder.Services.AddSingleton<GamsdaqTools>();
@@ -33,7 +49,25 @@ builder.Services.AddSingleton<CopilotAgentOrchestrator>();
 var app = builder.Build();
 GamsdaqTelemetry.AttachApplicationInsights(app.Services.GetService<Microsoft.ApplicationInsights.TelemetryClient>());
 
+app.Use(async (context, next) =>
+{
+    context.Response.Headers["X-Content-Type-Options"] = "nosniff";
+    context.Response.Headers["X-Frame-Options"] = "DENY";
+    context.Response.Headers["Referrer-Policy"] = "no-referrer";
+    context.Response.Headers["X-Permitted-Cross-Domain-Policies"] = "none";
+
+    var path = context.Request.Path.Value ?? string.Empty;
+    if (path.Equals("/api/wallet-and-cart", StringComparison.OrdinalIgnoreCase) ||
+        path.StartsWith("/api/cart/", StringComparison.OrdinalIgnoreCase))
+    {
+        context.Response.Headers["Cache-Control"] = "no-store";
+    }
+
+    await next();
+});
+
 app.UseCors();
+app.UseRateLimiter();
 app.UseDefaultFiles();
 app.UseStaticFiles();
 
@@ -48,11 +82,25 @@ app.MapGet("/api/health", (CopilotSdkChatClientAdapter copilotAdapter) => Result
     service = "Gamsdaq.Api",
     copilotSdk = "GitHub.Copilot.SDK 1.0.29-preview.8",
     agentFramework = "Microsoft.Agents.AI 1.27.0",
+    registeredAgents = new[]
+    {
+        "SpecNormalizerAgent",
+        "PriceDiscoveryAgent",
+        "BaitFilterVerifierAgent",
+        "OptimalQuoteAdvisorAgent",
+        "AuditorGuardrailAgent"
+    },
     mode = "VIRTUAL_PAPER_TRADING",
     toolExecutionMode = copilotAdapter.LastToolExecutionMode,
     supportedExecutionModes = CopilotSdkChatClientAdapter.SupportedExecutionModes,
     copilotSessionMode = copilotAdapter.ConnectionStatus,
     dataProvenance = "SIMULATED_PUBLIC_BENCHMARK (KAMIS & Open-Market Snapshot 2026-11-05)",
+    securityPolicy = new
+    {
+        piiRetention = "ZERO_RAW_PII_IN_MEMORY_MASKED_ON_INGEST",
+        securityHeaders = true,
+        rateLimiting = "ACTIVE"
+    },
     telemetry = GamsdaqTelemetry.GetSnapshot(),
     tickers = new[] { "JJ-GYUL-12B-3KG", "CD-BANSI-13B-5KG" },
     timestamp = DateTime.UtcNow
