@@ -52,7 +52,11 @@ $$P_{\text{wholesale}} \text{ (산지 도매 출하가)} < P_{\text{Gamsdaq}} \t
 | 온라인 표면 최저가 (미끼) | 9,900원 | [탈락] 에이전트 탈락 판정: 배송비 4,500원 별도 + 당도 미보장 파지 혼합과 |
 | 산지 도매 출하가 ($P_{\text{wholesale}}$) | **9,200원** | 농부가 공판장 출하 시 손에 쥐는 기준 금액 |
 | AI 검증 인터넷 실질 최저가 ($P_{\text{retail}}$) | **15,800원** | [통과] 12브릭스 이상·3kg·무료배송(또는 배송비 합산) 동일 스펙 최저가 |
-| **감스닥 AI 추천 상생 호가 ($P_{\text{opt}}$)** | **12,400원** | **농부 +3,200원(+34.8%) 추가 수익 / 소비자 -3,400원(-21.5%) 절약** |
+| **감스닥 초기 시드 체결가 예시** | **12,400원** | **농부 +3,200원(+34.8%) 추가 수익 / 소비자 -3,400원(-21.5%) 절약 기대** (고정 추천가 아님) |
+
+**가격·출처·효과 해석**: 감귤 **12,400원**, 반시 **18,900원**은 초기 시드 체결가입니다. 초기 OBI 추천가는 각각 **12,700원**(농가 +38.0%, 소비자 19.6% 절감), **19,500원**(+39.3%, 21.4% 절감)이며, 반시 매도 200박스 추가 시(매도 589 / 매수 290) **19,300원**(+37.9%, 22.2% 절감)으로 변합니다. KAMIS 공영도매시장 및 오픈마켓 후보군은 결정론적 재현성을 위한 **시뮬레이션 벤치마크 스냅샷**이며, 지역 효과는 실제 현장 실증이 아닌 **시뮬레이션 기반 기대 효과**입니다.
+
+**검증과 책임 있는 실행**: 10종 `AIFunction`, 5개 에이전트를 사용합니다. 모델의 도구 선택은 `COPILOT_SDK_MODEL_DIRECTED_AIFUNCTION`, 결정론적 선택 후 라이브 요약만 성공한 실행은 `COPILOT_SDK_SYNTHESIS_WITH_AIFUNCTION`으로 구분합니다. 감사 전 변경은 독립 작업 사본에 격리하고 `[감사 대기]`를 표시하며, 실패·예외·취소 시 FIFO 주문·예수금·예약금까지 복원합니다. **122+개 테스트**를 `dotnet test Gamsdaq.sln --configuration Release`로 검증합니다.
 
 ---
 
@@ -66,7 +70,7 @@ $$P_{\text{wholesale}} \text{ (산지 도매 출하가)} < P_{\text{Gamsdaq}} \t
 |---|---|---|---|
 | **`ideation.md`** (본 문서) | **WHY & WHAT** | • 왜 청도 농산물 유통에 호가창과 최저가 검증 에이전트가 필요한가?<br>• 가상 거래 대상 2개 핵심 품목(`JJ-GYUL-12B-3KG`, `CD-BANSI-13B-5KG`)과 상생 가격 밴드($P_{\text{wholesale}} < P_{\text{Gamsdaq}} < P_{\text{retail}}$) 정의 | **#2 생산성 향상 및 문제 적합성 (18%)**<br>**#7 혁신성 및 독창성 (5%)** |
 | **`PRD.md`** | **USER & UX** | • 소비자와 고령 농부가 어떤 워크플로로 호가를 걸고 체결하는가?<br>• 토스증권 스타일 간편거래 UI(`TypeScript + Vite + Zero-Radius CSS Design System (src/gamsdaq-web)`) 및 요구사항(`FR-01`~`FR-07`) 정의 | **#4 기능 완성도 (16%)**<br>**#5 사용자 경험 및 워크플로 (12%)** |
-| **`TRD.md`** | **HOW & MATH** | • 인터넷 최저가 판정 4-Gate 알고리즘(`GATE-01`~`GATE-04`)과 수식($P_{\text{eff}}$, $P_{\text{opt}}$)<br>• 5대 에이전트 모델 분배, 결정론적 C# `AIFunction` 도구 위임(9종), Maker-Checker 교차 검증, Azure Bicep 아키텍처(`minReplicas: 1, maxReplicas: 1`) | **#1 Copilot SDK + MS Agent Framework (25%)**<br>**#3 Azure 클라우드 통합 (18%)** |
+| **`TRD.md`** | **HOW & MATH** | • 인터넷 최저가 판정 4-Gate 알고리즘(`GATE-01`~`GATE-04`)과 수식($P_{\text{eff}}$, $P_{\text{opt}}$)<br>• 5대 에이전트 모델 분배, 결정론적 C# `AIFunction` 도구 위임(10종), Maker-Checker 교차 검증, Azure Bicep 아키텍처(`minReplicas: 1, maxReplicas: 1`) | **#1 Copilot SDK + MS Agent Framework (25%)**<br>**#3 Azure 클라우드 통합 (18%)** |
 | **`AGENTS.md`** | **GOVERNANCE** | • 코딩 에이전트 및 런타임 5대 에이전트의 행동 헌법<br>• 모든 에이전트 단계별 **`MUST` / `SHOULD` / `MUST NOT`** 강제 규칙 및 안전 불변식 | **#1 에이전트 오케스트레이션 (25%)**<br>**#6 책임 있는 AI, 보안 및 신뢰 (6%)** |
 
 ---
@@ -77,7 +81,7 @@ AI 심사위원 및 평가 에이전트가 각 평가 항목의 충족 근거를
 
 | 평가 ID | 평가 항목 | 가중치 | 핵심 설계 및 구현 증거 (Verification Evidence) | 참조 문서 및 섹션 |
 |---|---|---:|---|---|
-| **`CRIT-01`** | **GitHub Copilot SDK 및 Microsoft Agent Framework의 효과적인 활용** | **25%** | • `GitHub.Copilot.SDK` 모델 연결 + `Microsoft.Agents.AI` 5단계 멀티 에이전트 오케스트레이션<br>• 암산 배제 원칙(`MUST NOT`): 모든 가격·단가 계산을 C# `AIFunction` Tool Calling(`GamsdaqTools.cs` 9종 도구)으로 위임<br>• SSE 실시간 에이전트 추론 스트리밍(`POST /api/agents/verify-stream`) 및 `AuditorGuardrailAgent` 교차 검증 | `TRD.md` §2<br>`AGENTS.md` §2, §3.1 |
+| **`CRIT-01`** | **GitHub Copilot SDK 및 Microsoft Agent Framework의 효과적인 활용** | **25%** | • `GitHub.Copilot.SDK` 모델 연결 + `Microsoft.Agents.AI` 5단계 멀티 에이전트 오케스트레이션<br>• 암산 배제 원칙(`MUST NOT`): 모든 가격·단가 계산을 C# `AIFunction` Tool Calling(`GamsdaqTools.cs` 10종 도구)으로 위임<br>• SSE 실시간 에이전트 추론 스트리밍(`POST /api/agents/verify-stream`) 및 `AuditorGuardrailAgent` 교차 검증 | `TRD.md` §2<br>`AGENTS.md` §2, §3.1 |
 | **`CRIT-02`** | **생산성 향상 효과 및 문제 적합성** | **18%** | • 청도 사회문제(농산물 유통 경쟁력, 수급·가격 예측, 고령 농부 디지털 격차) 직접 해결<br>• `12브릭스 노지 감귤 3kg`(+34.8% 농가수익, -21.5% 소비자절감) 및 `청도 명품 반시 대과 5kg`(+35.0% 농가수익, -23.8% 소비자절감) 정량 입증 | `cheongdo-social-issues.md`<br>`ideation.md` §1~§3<br>`PRD.md` §1~§2 |
 | **`CRIT-03`** | **Azure 클라우드 통합** | **18%** | • 과잉 리소스 배제(`MUST NOT`): `Azure Container Apps` (`minReplicas: 1, maxReplicas: 1`) + `ACR` + `Application Insights` 핵심 클라우드 네이티브 구성<br>• `infra/main.bicep` IaC 및 GitHub Actions 반복 가능 배포 + OpenTelemetry 관측성 | `TRD.md` §5<br>`AGENTS.md` §3.4 |
 | **`CRIT-04`** | **기능 완성도 및 기술적 구현** | **16%** | • 2개 핵심 품목 고정 및 안전한 **가상 거래(Paper Trading)** 시뮬레이터로 End-to-End 무결성 확보<br>• 스레드 안전한 Price-Time Priority 호가 매칭 엔진 및 결정론적 `decimal`/`int` 연산 | `PRD.md` §4<br>`TRD.md` §3~§4 |

@@ -14,6 +14,8 @@ namespace Gamsdaq.Api.Tools;
 public class GamsdaqTools
 {
     private readonly MarketEngineService _market;
+    private readonly AsyncLocal<MarketEngineService?> _verificationWorkspace = new();
+    private MarketEngineService ActiveMarket => _verificationWorkspace.Value ?? _market;
 
     public GamsdaqTools(MarketEngineService market)
     {
@@ -200,20 +202,20 @@ public class GamsdaqTools
         return false;
     }
 
-    public ProduceTicker LookupStandardTickerTool(string tickerCode) => _market.GetTicker(tickerCode);
+    public ProduceTicker LookupStandardTickerTool(string tickerCode) => ActiveMarket.GetTicker(tickerCode);
 
     [Description("온라인 오픈마켓 소매 가격 후보 리스트를 수집합니다.")]
     public List<EcommerceCandidate> SearchEcommerceListingsTool(
         [Description("표준 티커 코드")] string tickerCode)
     {
-        return _market.GetCandidates(tickerCode);
+        return ActiveMarket.GetCandidates(tickerCode);
     }
 
     [Description("KAMIS 및 산지 공판장 도매 기준가를 조회합니다.")]
     public WholesaleBenchmarkResult FetchWholesaleBenchmarkTool(
         [Description("표준 티커 코드")] string tickerCode)
     {
-        var ticker = _market.GetTicker(tickerCode);
+        var ticker = ActiveMarket.GetTicker(tickerCode);
         return new WholesaleBenchmarkResult(
             TickerCode: ticker.Code,
             WholesalePrice: ticker.WholesalePrice,
@@ -228,16 +230,16 @@ public class GamsdaqTools
         ProducePricingMath.CalculateEffectivePrice(listedPrice, shippingFee, actualWeightKg, targetWeightKg);
 
     public EcommerceCandidate EvaluateBaitRulesTool(string tickerCode, EcommerceCandidate candidate) =>
-        ProducePricingMath.Evaluate(candidate, _market.GetTicker(tickerCode));
+        ProducePricingMath.Evaluate(candidate, ActiveMarket.GetTicker(tickerCode));
 
     [Description("원본 후보를 재평가하여 실질 최저가를 확정합니다. 통과 후보가 없으면 최저가는 0입니다.")]
     public virtual BaitVerificationSummary VerifyFourGateLowestPriceTool(
         [Description("표준 티커 코드")] string tickerCode,
         [Description("탐색 단계의 원본 후보. 생략하면 현재 후보를 조회합니다.")] List<EcommerceCandidate>? candidates = null)
     {
-        var ticker = _market.GetTicker(tickerCode);
-        var summary = ProducePricingMath.Verify(ticker, candidates ?? _market.GetCandidates(tickerCode));
-        _market.UpdateVerifiedMarket(summary);
+        var ticker = ActiveMarket.GetTicker(tickerCode);
+        var summary = ProducePricingMath.Verify(ticker, candidates ?? ActiveMarket.GetCandidates(tickerCode));
+        ActiveMarket.UpdateVerifiedMarket(summary);
         GamsdaqTelemetry.CandidatesInspected.Add(summary.TotalCandidatesInspected);
         GamsdaqTelemetry.BaitRejected.Add(summary.RejectedBaitCount);
         GamsdaqTelemetry.BaitRejectionRate.Record(summary.TotalCandidatesInspected == 0
@@ -245,13 +247,33 @@ public class GamsdaqTools
         return summary;
     }
 
-    public OrderBookSnapshot GetOrderBookSnapshotTool(string tickerCode) => _market.GetOrderBook(tickerCode);
+    public OrderBookSnapshot GetOrderBookSnapshotTool(string tickerCode) => ActiveMarket.GetOrderBook(tickerCode);
 
-    public (ProduceTicker Ticker, List<EcommerceCandidate> VerifiedCandidates) CaptureCheckpoint(string tickerCode) =>
+    public MarketEngineService.VerificationCheckpoint CaptureCheckpoint(string tickerCode) =>
         _market.CaptureVerificationCheckpoint(tickerCode);
 
-    public void RestoreCheckpoint(string tickerCode, (ProduceTicker Ticker, List<EcommerceCandidate> VerifiedCandidates) checkpoint) =>
-        _market.RestoreVerificationCheckpoint(tickerCode, checkpoint);
+    public virtual void RestoreCheckpoint(string tickerCode, MarketEngineService.VerificationCheckpoint checkpoint,
+        MarketEngineService? workspace = null) =>
+        (workspace ?? _market).RestoreVerificationCheckpoint(tickerCode, checkpoint);
+
+    public MarketEngineService CreateVerificationWorkspace(MarketEngineService.VerificationCheckpoint checkpoint) =>
+        _market.CreateVerificationWorkspace(checkpoint);
+
+    public bool TryCommitVerification(MarketEngineService.VerificationCheckpoint checkpoint,
+        BaitVerificationSummary summary, OptimalQuoteResult quote) =>
+        _market.TryCommitVerification(checkpoint, summary, quote);
+
+    public IDisposable UseVerificationWorkspace(MarketEngineService workspace)
+    {
+        var previous = _verificationWorkspace.Value;
+        _verificationWorkspace.Value = workspace;
+        return new WorkspaceScope(() => _verificationWorkspace.Value = previous);
+    }
+
+    private sealed class WorkspaceScope(Action restore) : IDisposable
+    {
+        public void Dispose() => restore();
+    }
 
     private static readonly string[] TrustedSourceDomains =
         ["coupang.com", "naver.com", "11st.co.kr", "gmarket.co.kr", "ssg.com", "kamis.or.kr"];
@@ -261,7 +283,7 @@ public class GamsdaqTools
         [Description("표준 티커 코드")] string tickerCode,
         [Description("재감사 시 적용할 추가 안전 하한")] int? minimumPrice = null,
         [Description("재감사 시 적용할 추가 안전 상한")] int? maximumPrice = null) =>
-        _market.RecomputeOptimalQuote(tickerCode, minimumPrice, maximumPrice);
+        ActiveMarket.RecomputeOptimalQuote(tickerCode, minimumPrice, maximumPrice);
 
     [Description("Maker-Checker 불변식을 검증합니다: WholesalePrice < OptimalPrice < RetailLowestPrice, 100원 호가 단위, 채택 최저가 상품의 당도/등급 스펙 일치, 원본 출처(Source) 존재 여부")]
     public virtual AuditResult AuditQuoteInvariantsTool(

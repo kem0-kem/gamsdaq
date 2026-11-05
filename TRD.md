@@ -47,6 +47,9 @@
 * **초기 시드 오더북 기준 검산 (`OptimalQuote_MatchesDecimalFormulaExactly` 테스트 검증)**:
   1. **`JJ-GYUL-12B-3KG`**: $P_{\text{mid}} = 0.48(9200)+0.52(15800) = 12,632\text{원}$. 초기 잔량 $Q_{\text{ask}}=340, Q_{\text{bid}}=407 \implies \text{OBI} = \frac{67}{748} \approx +0.08957$. $P_{\text{raw}} = 12,632 + 0.08(0.08957)(6600) = 12,679.29\text{원} \implies \mathbf{12,700\text{원}}$.
   2. **`CD-BANSI-13B-5KG`**: $P_{\text{mid}} = 0.48(14000)+0.52(24800) = 19,616\text{원}$. 초기 잔량 $Q_{\text{ask}}=389, Q_{\text{bid}}=290 \implies \text{OBI} = \frac{-99}{680} \approx -0.14559$. $P_{\text{raw}} = 19,616 + 0.08(-0.14559)(10800) = 19,490.21\text{원} \implies \mathbf{19,500\text{원}}$.
+
+* **시드/동적 가격 구분**: 감귤 **12,400원**, 반시 **18,900원**은 초기 시드 체결가이며 고정 추천가가 아닙니다. 초기 OBI 추천가는 위 검산대로 **12,700원 / 19,500원**입니다. 반시에 19,300원 매도 주문 200박스를 추가하면 매도 589 / 매수 290, OBI = -299/880, 반올림 전 19,322.44원이므로 추천가는 **19,300원**입니다(`OptimalQuote_BansiAdditionalTwoHundredAsks_RecomputesTo19300`).
+* KAMIS 공영도매시장 및 오픈마켓 후보군은 **시뮬레이션 벤치마크 스냅샷**입니다. 출처 URL은 참조 경로이지 실시간 수집 증빙이 아니며, 농가 수취가 개선율·소비자 절감률은 **시뮬레이션 기반 기대 효과**입니다.
   * 매 주문 체결·등록 시 `MarketEngineService.RefreshOptimalPrice`가 변경된 $Q_{\text{bid}}, Q_{\text{ask}}$로 `AiOptimalPrice`를 즉시 재계산합니다.
 
 ---
@@ -70,6 +73,7 @@ flowchart LR
 * **`CopilotSdkChatClientAdapter : IChatClient, IAsyncDisposable` 동작 메커니즘**:
   1. **도구 바인딩 에이전트 실행 (`toolExecutionMode: "DETERMINISTIC_AIFUNCTION"`)**: `ChatClientAgent.RunAsync` 호출 시 `ChatOptions.Tools`에 바인딩된 `AIFunction` 목록을 사전 Allowlist로 검증(미바인딩 도구 요청 시 실행 전 `InvalidOperationException` 차단)하고, 각 `AIFunction.InvokeAsync`를 실제 호출하여 표준 `FunctionCallContent`/`FunctionResultContent`와 도구별 실행 시간(`LatencyMs`), 결과 JSON(`AgentToolExecution`)을 반환합니다.
   2. **라이브 Copilot 세션 연결 (`copilotSessionMode`)**: 바인딩된 도구가 없는 비정형 대화 요청은 `Lazy<CopilotClient>`로 `CreateSessionAsync` -> `SendAndWaitAsync`를 호출하며, 실패 시 가짜 성공 문자열로 위장하지 않고 예외를 투명하게 전파합니다(`GET /api/health`에서 `toolExecutionMode`와 `copilotSessionMode`를 분리 표기).
+  3. **도구 선택과 사후 요약 분리**: 모델이 도구를 선택한 경우만 `COPILOT_SDK_MODEL_DIRECTED_AIFUNCTION`입니다. 결정론적으로 선택한 도구 결과를 SDK가 요약만 한 경우 `COPILOT_SDK_SYNTHESIS_WITH_AIFUNCTION`으로 표시하며, 요약 실패가 모델 주도 선택 여부를 바꾸지 않습니다. 요청 취소는 fallback으로 숨기지 않고 전파합니다.
 
 ### 2.2 에이전트별 역할 및 10개 C# `AIFunction` 도구 입출력 스키마
 
@@ -79,9 +83,13 @@ flowchart LR
 | **2** | **`PriceDiscoveryAgent`** | `search_ecommerce_listings`, `fetch_wholesale_benchmark` | `(string tickerCode)`, `(string tickerCode)` | `List<EcommerceCandidate>`, `WholesaleBenchmarkResult` |
 | **3** | **`BaitFilterVerifierAgent`** | `calculate_effective_price`, `evaluate_bait_rules`, `verify_four_gate_lowest_price` | `(int listedPrice, int shippingFee, decimal actualWeightKg, decimal targetWeightKg)`, `(string tickerCode, EcommerceCandidate candidate)`, `(string tickerCode, List<EcommerceCandidate>? candidates)` | `int`, `EcommerceCandidate`, `BaitVerificationSummary` |
 | **4** | **`OptimalQuoteAdvisorAgent`** | `get_order_book_snapshot`, `compute_win_win_optimal_quote` | `(string tickerCode)`, `(string tickerCode, int? minimumPrice, int? maximumPrice)` | `OrderBookSnapshot`, `OptimalQuoteResult` |
-| **5** | **`AuditorGuardrailAgent`** | `audit_quote_invariants` | `(int wholesalePrice, int optimalPrice, int retailLowestPrice, int rejectedBaitCount)` | `AuditResult` (`AuditPassed`, 3대 불변식 플래그) |
+| **5** | **`AuditorGuardrailAgent`** | `audit_quote_invariants` | 가격 3종·미끼 제외 수, 채택/목표 Brix·등급, 출처 존재 여부·채택 URL | `AuditResult` (`AuditPassed`, 가격·호가단위·미끼제외·스펙·출처 불변식 플래그) |
 
 ### 2.3 Maker-Checker 재시도 종료 규칙 및 프롬프트 인젝션 방어
+* **감사 전 격리와 원자적 확정**: `CaptureVerificationCheckpoint`는 티커·후보군, 매수/매도 FIFO 큐 전체(`Quantity`는 미체결 잔량, `Timestamp`와 `IsWalletFunded` 포함), `_virtualBalance` 및 `_reservedBalance`를 깊은 복사합니다. 이 구현에는 별도 `_orders`나 사용자별 `_portfolios`가 없으며 단일 시뮬레이션 지갑을 사용합니다.
+* `GamsdaqTools`는 각 비동기 에이전트 단계의 `AsyncLocal` 범위에서 요청 전용 `MarketEngineService` 작업 사본을 사용합니다. 따라서 `verify_four_gate_lowest_price`와 `compute_win_win_optimal_quote`가 감사 전 공개 시장을 변경하지 않습니다. 도구의 직접 호출은 기존 엔진 동작과 호환되며, 공개 SSE/자연어 파이프라인은 반드시 작업 사본을 사용합니다.
+* `STEP-1`~`STEP-5` 순서와 `STEP-4 COMPLETED` 상태를 유지하면서 요약에 `[감사 대기]`를 붙입니다. 감사 통과 시 `TryCommitVerification`이 시장 버전을 확인하고 가격·후보·주문 취소·예약금 해제를 한 잠금에서 확정합니다. 감사 도중 주문이나 초기화가 발생하면 오래된 결과는 `AUDIT_FAILED`로 끝내며 동시 변경을 덮어쓰지 않습니다.
+* 감사 실패·도구 예외·요청 취소·SSE 열거 조기 종료는 `finally`의 `RestoreCheckpoint`로 작업 사본의 FIFO 주문과 예수금까지 복원합니다. 확정 도중 예외는 같은 잠금 안에서 공개 시장 체크포인트를 복원합니다. 관련 회귀 테스트는 `AgentPipeline_IsolatesPruningUntilAuditAndCommitsOnlyPassedResults`, `AgentPipeline_ExceptionAfterPruningRestoresOrdersAndReservedCash`, `AgentPipeline_CancellationOrEarlyDisposalRestoresPrivateCheckpoint`, `AgentPipeline_ConcurrentMarketChangeRejectsStaleCommitWithoutUndoingNewState`입니다.
 * **Maker-Checker 감사 및 재시도 상한 (`maxRetries = 2`)**: `AuditorGuardrailAgent`는 ① 엄격 부등식 **$P_{\text{wholesale}} < P_{\text{opt}} < P_{\text{retail}}$**, ② $P_{\text{opt}} \pmod{100} = 0$, ③ `rejectedBaitCount > 0`을 검증합니다. 위반 시 `AUDIT_RETRY` SSE 이벤트를 방출하고 안전 경계($[P_{\text{wholesale}}+500, P_{\text{retail}}-500]$)를 주입하여 **최대 2회(`maxRetries = 2`)** 재산출합니다. 2회 재시도 후에도 실패하면 `AUDIT_FAILED`를 반환합니다.
 * **프롬프트 인젝션 방어 (`PromptShieldGuardrail.ValidateAndSanitize`)**: 300자 길이 절단 **이전에** 전체 문자열에 대해 유니코드 `FormKC` 정규화, 제로폭 문자(`\u200B-\u200D\uFEFF`) 제거, 공백·기호 압축(`Compact`)을 수행하여 300자 뒤에 숨긴 우회 페이로드까지 100% 차단(`STEP-0 BLOCKED`)하며, 정상 농가 문장 오탐을 방지하도록 복합 인젝션 구문 패턴을 정밀화했습니다.
 
@@ -122,13 +130,13 @@ flowchart LR
 2. **Azure Container Registry (`Basic`) & 멀티스테이지 `Dockerfile`**: Node 22 프론트엔드 빌드 + .NET 10 SDK 빌드 -> .NET 10 ASP.NET 런타임(포트 `8080`). `deployContainerApp` 조건부 파라미터로 ACR 선프로비저닝 및 이미지 빌드 후 Container App 배포 2단계 구성을 지원합니다.
 3. **Log Analytics (`PerGB2018`) & Application Insights (`web`)**: `GamsdaqTelemetry.cs`의 OpenTelemetry `ActivitySource("Gamsdaq.Agents")` 및 `Meter("Gamsdaq.Metrics")` 7종 지표를 수집합니다.
 4. **Azure Container Apps (`*.azurecontainerapps.io`)**: `koreacentral`, 외부 인그레스(`targetPort: 8080`), `0.5 vCPU` / `1.0Gi`, `minReplicas: 1, maxReplicas: 1`(불필요한 HTTP 스케일 규칙 제거), `/api/health` Liveness/Readiness 프로브.
-5. **CI/CD (`.github/workflows/deploy-azure.yml`)**: `az bicep build` 검증 + `dotnet test` (109개 테스트) + `npm run build` -> `az deployment group create (deployContainerApp=false)` -> `az acr build` -> `az deployment group create (deployContainerApp=true)` -> `/api/health`, `/api/tickers`, `/api/agents/verify-stream` SSE 라이브 스모크 체크.
+5. **CI/CD (`.github/workflows/deploy-azure.yml`)**: `az bicep build` 검증 + `dotnet test` (122+개 테스트) + `npm run build` -> `az deployment group create (deployContainerApp=false)` -> `az acr build` -> `az deployment group create (deployContainerApp=true)` -> `/api/health`, `/api/tickers`, `/api/agents/verify-stream` SSE 라이브 스모크 체크.
 
 ---
 
 ## 6. 구현 소스코드 매핑 및 자동화 테스트 검증 명세 (109 Test Cases)
 
-`dotnet test Gamsdaq.sln --configuration Release` 실행 시 `tests/Gamsdaq.Tests/GamsdaqEngineTests.cs`의 **총 109개 단위·경계값·동시성 테스트 케이스가 100% 통과**합니다.
+`dotnet test Gamsdaq.sln --configuration Release`로 `tests/Gamsdaq.Tests/GamsdaqEngineTests.cs`의 **122+개 단위·경계값·동시성 테스트**를 검증합니다. 정확한 최신 통과 수는 해당 실행 결과를 기준으로 합니다.
 
 | 검증 영역 | 구현 파일 경로 | 대표 자동화 테스트 메서드 (`GamsdaqEngineTests.cs`) | 검증된 핵심 불변식 |
 |---|---|---|---|
@@ -137,5 +145,4 @@ flowchart LR
 | **다단계 Price-Time Priority 매칭 엔진** | `Matching/MarketEngineService.cs` | `Buy_WalksTwoLevels_DeductsExactTotalAndLeavesRealPartialDepth`<br>`BuyMarket_InsufficientBalanceAtSecondLevel_IsAtomic`<br>`SellLimit_ExecutesAtRestingBestBidNotIncomingLimit`<br>`SamePriceOrders_FillInFifoOrderAndPreservePartialOrdersTimestamp`<br>`ConcurrentBuys_DoNotOverfillOrLoseQuantity`<br>`MarketEngineService_MasksPhonePiiAndSupportsDemoReset` | 다단계 Walk-the-Book, 지정가 예약금 관리, 50개 동시 매수 스레드 안전성, 연락처 마스킹 및 데모 초기화 |
 | **Responsible AI & 프롬프트 인젝션 방어** | `Security/PromptShieldGuardrail.cs` | `PromptShield_BlocksNormalizedOverrideAndMarkupPatterns`<br>`PromptShield_InspectsInjectionAfterThreeHundredCharactersBeforeLengthRejection`<br>`PromptShield_AllowsBenignFarmerSentencesAndBlocksIndirectCandidateInjection`<br>`OrderGuardrail_EnforcesBothBoundsTickAndQuantity` | 300자 뒤 인젝션 선탐지 차단, 간접 인젝션(`GATE-00`) 차단, 엄격 부등식($P_{\text{wholesale}} < P < P_{\text{retail}}$) 강제 |
 | **OpenTelemetry 관측성** | `Diagnostics/GamsdaqTelemetry.cs` | `Telemetry_EmitsAgentToolAndMatchingActivitiesAndMetrics` | 에이전트 단계별 Trace Activity 및 미끼 탈락률·매칭 지연 시간 Histogram 메트릭 실시간 방출 검증 |
-
 

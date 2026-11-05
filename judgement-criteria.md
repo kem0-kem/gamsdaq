@@ -27,8 +27,9 @@
   * 가격 계산 및 규칙 판정은 LLM의 암산에 의존하지 않고 결정론적 함수 도구(`AIFunction`)를 호출해야 합니다.
 * **검증 경로**:
   * 오케스트레이터: `src/Gamsdaq.Api/Agents/CopilotAgentOrchestrator.cs` (`SpecNormalizerAgent` -> `PriceDiscoveryAgent` -> `BaitFilterVerifierAgent` -> `OptimalQuoteAdvisorAgent` -> `AuditorGuardrailAgent`)
-  * 결정론적 도구(9종): `src/Gamsdaq.Api/Tools/GamsdaqTools.cs` (`parse_produce_spec`, `search_ecommerce_listings`, `fetch_wholesale_benchmark`, `evaluate_bait_rules`, `calculate_effective_price`, `verify_four_gate_lowest_price`, `get_order_book_snapshot`, `compute_win_win_optimal_quote`, `audit_quote_invariants`)
+  * 결정론적 도구(10종): `src/Gamsdaq.Api/Tools/GamsdaqTools.cs` (`parse_produce_spec`, `lookup_standard_ticker`, `search_ecommerce_listings`, `fetch_wholesale_benchmark`, `evaluate_bait_rules`, `calculate_effective_price`, `verify_four_gate_lowest_price`, `get_order_book_snapshot`, `compute_win_win_optimal_quote`, `audit_quote_invariants`)
   * 실시간 스트리밍 API: `POST /api/agents/verify-stream` (`text/event-stream`)
+  * 실행 모드: 모델이 도구를 선택한 경우에만 `COPILOT_SDK_MODEL_DIRECTED_AIFUNCTION`. 결정론적 선택 + 라이브 요약 성공은 `COPILOT_SDK_SYNTHESIS_WITH_AIFUNCTION`, 라이브 요약 없는 결정론적 실행은 `DETERMINISTIC_AIFUNCTION`.
 
 ### 2.2 CRIT-02: 생산성 향상 효과 및 문제 적합성 (18%)
 * **요구 사항**:
@@ -37,6 +38,8 @@
   * `CD-BANSI-13B-5KG` (청도 명품 반시 대과 5kg): 도매가 14,000원 대비 농가 수취가 **+35.0% 향상**(18,900원), 인터넷 실질 최저가 24,800원 대비 소비자 **-23.8% 절감**
   * `JJ-GYUL-12B-3KG` (12브릭스 노지 감귤 3kg): 도매가 9,200원 대비 농가 수취가 **+34.8% 향상**(12,400원), 인터넷 실질 최저가 15,800원 대비 소비자 **-21.5% 절감**
   * 고령 농부 자연어 1줄 출하 엔드포인트: `POST /api/farmers/natural-quote`
+  * 위 12,400원 / 18,900원은 **초기 시드 체결가 예시**입니다. 초기 OBI 추천가는 감귤 **12,700원**(농가 +38.0%, 소비자 19.6% 절감), 반시 **19,500원**(+39.3%, 21.4% 절감)입니다. 반시 매도 200박스 추가 시(매도 589 / 매수 290) **19,300원**(+37.9%, 22.2% 절감)으로 변합니다.
+  * KAMIS 공영도매시장 및 오픈마켓 후보군은 **시뮬레이션 벤치마크 스냅샷**이며 실시간 API 수집 자료가 아닙니다. 지역 효과는 현장 실증이 아닌 **시뮬레이션 기반 기대 효과**입니다. 자연어 입력 후 호가산출 → 등록 → 최종 승인 3클릭을 지원하며, 실제 소요 시간은 `elapsedMs`로 구분합니다.
 
 ### 2.3 CRIT-03: Azure 클라우드 통합 (18%)
 * **요구 사항**:
@@ -50,7 +53,7 @@
   * 별도 로그인이나 외부 API 키 설정 없이 즉시 전체 기능을 체험하고 검증할 수 있어야 합니다.
 * **검증 경로**:
   * 호가 매칭 및 장바구니 배송 엔진: `src/Gamsdaq.Api/Matching/MarketEngineService.cs`
-  * 자동화 검증 테스트: `tests/Gamsdaq.Tests/GamsdaqEngineTests.cs`
+  * 자동화 검증 테스트: `tests/Gamsdaq.Tests/GamsdaqEngineTests.cs` (**122+개 단위·경계값·동시성 테스트**, `dotnet test Gamsdaq.sln --configuration Release`)
 
 ### 2.5 CRIT-05: 사용자 경험 (UX) (12%)
 * **요구 사항**:
@@ -65,6 +68,8 @@
 * **검증 경로**:
   * 보안 가드레일: `src/Gamsdaq.Api/Security/PromptShieldGuardrail.cs`
   * 교차 감사 에이전트: `AuditorGuardrailAgent` 및 `audit_quote_invariants` 도구
+  * 요청별 검증 작업 사본에서만 가격 변경·주문 취소·예약금 해제를 계산합니다. `STEP-4`는 `[감사 대기]`, `STEP-5 AUDIT_PASSED` 직전에 시장 버전 확인과 단일 잠금으로 확정합니다. 감사 실패·예외·취소·스트림 조기 종료 시 체크포인트를 복원하며, 동시 주문·초기화가 발생하면 확정하지 않고 `AUDIT_FAILED`로 반환합니다.
+  * 체크포인트는 티커·검증 후보뿐 아니라 양방향 FIFO 주문 전체(잔량·최초 시각·지갑 예약 여부), 전체 가상 예수금과 예약금을 깊은 복사합니다. 구현 자료구조는 `_asks`/`_bids`, `_virtualBalance`/`_reservedBalance`이며 별도 `_orders`/`_portfolios` 필드는 없습니다.
   * Human-in-the-Loop 주문 승인: `confirmedByUser: true` 검증 및 프론트엔드 승인 모달
 
 ### 2.7 CRIT-07: 창의성 및 혁신성 (5%)

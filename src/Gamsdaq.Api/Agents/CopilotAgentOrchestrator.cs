@@ -32,16 +32,19 @@ public sealed class CopilotSdkChatClientAdapter : IChatClient, IAsyncDisposable
     private readonly ILogger<CopilotSdkChatClientAdapter> _logger;
     private readonly Lazy<CopilotClient> _copilotClient;
     private readonly Func<IReadOnlyList<ChatMessage>, IReadOnlyDictionary<string, AIFunction>, CancellationToken, Task<ToolInvocationPlan?>>? _modelToolPlanner;
+    private readonly Func<string, CancellationToken, Task<string?>>? _copilotSynthesizer;
     private int _disposed;
 
     public string ConnectionStatus { get; private set; } = "RESILIENT_FALLBACK_DETERMINISTIC_AIFUNCTION";
 
     public CopilotSdkChatClientAdapter(
         ILogger<CopilotSdkChatClientAdapter> logger,
-        Func<IReadOnlyList<ChatMessage>, IReadOnlyDictionary<string, AIFunction>, CancellationToken, Task<ToolInvocationPlan?>>? modelToolPlanner = null)
+        Func<IReadOnlyList<ChatMessage>, IReadOnlyDictionary<string, AIFunction>, CancellationToken, Task<ToolInvocationPlan?>>? modelToolPlanner = null,
+        Func<string, CancellationToken, Task<string?>>? copilotSynthesizer = null)
     {
         _logger = logger;
         _modelToolPlanner = modelToolPlanner;
+        _copilotSynthesizer = copilotSynthesizer;
         _copilotClient = new Lazy<CopilotClient>(() => new CopilotClient(new CopilotClientOptions
         {
             GitHubToken = ResolveGitHubToken(),
@@ -168,25 +171,37 @@ public sealed class CopilotSdkChatClientAdapter : IChatClient, IAsyncDisposable
 
         var batchMode = modelSelectedTools ? "COPILOT_SDK_MODEL_DIRECTED_AIFUNCTION" : "DETERMINISTIC_AIFUNCTION";
         string? copilotReasoning = null;
-        if (ResolveGitHubToken() is not null)
+        if (_copilotSynthesizer is not null || ResolveGitHubToken() is not null)
         {
             try
             {
-                await using var session = await _copilotClient.Value.CreateSessionAsync(
-                    BuildSessionConfig(systemText, functions), cancellationToken);
                 var toolSummary = string.Join(", ", executions.Select(e => $"{e.ToolName}=>{e.Result.GetRawText()}"));
-                var reply = await session.SendAndWaitAsync(
-                    BuildMessageOptions($"Summarize produce verification step concisely in Korean based on tool outputs: {toolSummary}", envelope?.UpstreamAgent ?? plan.UpstreamAgent),
-                    TimeSpan.FromSeconds(10),
-                    cancellationToken);
-                if (!string.IsNullOrWhiteSpace(reply?.Data?.Content))
+                string? summary;
+                if (_copilotSynthesizer is not null)
                 {
-                    copilotReasoning = reply.Data.Content;
-                    batchMode = "COPILOT_SDK_MODEL_DIRECTED_AIFUNCTION";
+                    summary = await _copilotSynthesizer(toolSummary, cancellationToken);
+                }
+                else
+                {
+                    await using var session = await _copilotClient.Value.CreateSessionAsync(
+                        BuildSessionConfig(systemText, functions), cancellationToken);
+                    var reply = await session.SendAndWaitAsync(
+                        BuildMessageOptions($"Summarize produce verification step concisely in Korean based on tool outputs: {toolSummary}", envelope?.UpstreamAgent ?? plan.UpstreamAgent),
+                        TimeSpan.FromSeconds(10),
+                        cancellationToken);
+                    summary = reply?.Data?.Content;
+                }
+                cancellationToken.ThrowIfCancellationRequested();
+                if (!string.IsNullOrWhiteSpace(summary))
+                {
+                    copilotReasoning = summary;
+                    batchMode = modelSelectedTools
+                        ? "COPILOT_SDK_MODEL_DIRECTED_AIFUNCTION"
+                        : "COPILOT_SDK_SYNTHESIS_WITH_AIFUNCTION";
                     ConnectionStatus = "CONNECTED_COPILOT_SDK_LIVE";
                 }
             }
-            catch (Exception ex)
+            catch (Exception ex) when (ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
             {
                 ConnectionStatus = $"RESILIENT_FALLBACK_DETERMINISTIC_AIFUNCTION ({ex.GetType().Name})";
                 _logger.LogInformation("Copilot live synthesis skipped ({Message}); using deterministic AIFunction output.", ex.Message);
@@ -246,7 +261,7 @@ public sealed class CopilotSdkChatClientAdapter : IChatClient, IAsyncDisposable
                     }
                 }
             }
-            catch (Exception ex)
+            catch (Exception ex) when (ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
             {
                 ConnectionStatus = $"RESILIENT_FALLBACK_DETERMINISTIC_AIFUNCTION ({ex.GetType().Name})";
             }
@@ -585,111 +600,143 @@ public class CopilotAgentOrchestrator
             specExecution.CopilotReasoning ?? $"규격 정규화 완료: [{spec.TickerCode}] {spec.StandardName}", spec, specExecution);
 
         var checkpoint = _tools.CaptureCheckpoint(spec.TickerCode);
+        var workspace = _tools.CreateVerificationWorkspace(checkpoint);
+        bool committed = false;
+        AgentStreamEvent finalEvent;
 
-        var discovery = await RunAgentStepAsync(
-            _priceDiscoveryAgent,
-            upstreamAgent: _specNormalizerAgent.Name!,
-            objective: "표준 티커에 해당하는 온라인 소매 후보군(5건 이상)과 공영도매시장 기준가를 수집한다.",
-            state: new Dictionary<string, object?>
-            {
-                ["tickerCode"] = spec.TickerCode,
-                ["normalizedSpec"] = spec
-            },
-            cancellationToken);
-        var listings = discovery.Read<List<EcommerceCandidate>>("search_ecommerce_listings");
-        var wholesale = discovery.Read<WholesaleBenchmarkResult>("fetch_wholesale_benchmark");
-        yield return Event("STEP-2", _priceDiscoveryAgent, "COMPLETED",
-            discovery.CopilotReasoning ?? $"원본 소매 후보 {listings.Count}건, 산지 도매 기준가 {wholesale.WholesalePrice:N0}원 확보",
-            new { wholesale, candidateCount = listings.Count }, discovery);
-
-        var verification = await RunAgentStepAsync(
-            _baitVerifierAgent,
-            upstreamAgent: _priceDiscoveryAgent.Name!,
-            objective: "모든 소매 후보의 실질 환산가를 계산하고 4-Gate 미끼 필터링을 수행해 실질 최저가를 확정한다.",
-            state: new Dictionary<string, object?>
-            {
-                ["tickerCode"] = spec.TickerCode,
-                ["targetWeightKg"] = spec.WeightKg,
-                ["candidates"] = listings,
-                ["wholesalePrice"] = wholesale.WholesalePrice
-            },
-            cancellationToken);
-        var baitSummary = verification.Read<BaitVerificationSummary>("verify_four_gate_lowest_price");
-        yield return Event("STEP-3", _baitVerifierAgent, "COMPLETED",
-            verification.CopilotReasoning ?? $"4-Gate 검증: {baitSummary.RejectedBaitCount}건 제외, 실질 최저가 {baitSummary.VerifiedRetailLowestPrice:N0}원 채택",
-            baitSummary, verification);
-
-        async Task<AgentToolBatchResult> QuoteAsync(bool retry) => await RunAgentStepAsync(
-            _optimalQuoteAgent,
-            upstreamAgent: _baitVerifierAgent.Name!,
-            objective: "현재 호가창 잔량(OBI)을 조회하고 상생 가격 밴드 내 최적 추천 호가와 즉시체결 호가를 계산한다.",
-            state: new Dictionary<string, object?>
-            {
-                ["tickerCode"] = spec.TickerCode,
-                ["minimumPrice"] = retry ? (int?)(wholesale.WholesalePrice + 500) : null,
-                ["maximumPrice"] = retry ? (int?)(baitSummary.VerifiedRetailLowestPrice - 500) : null,
-                ["wholesalePrice"] = wholesale.WholesalePrice,
-                ["verifiedRetailLowestPrice"] = baitSummary.VerifiedRetailLowestPrice
-            },
-            cancellationToken);
-
-        var quoteExecution = await QuoteAsync(false);
-        var optimalQuote = quoteExecution.Read<OptimalQuoteResult>("compute_win_win_optimal_quote");
-        var immediateInfo = optimalQuote.ImmediateMatchAskPrice.HasValue || optimalQuote.ImmediateMatchBidPrice.HasValue
-            ? $" [즉시체결 매수 {optimalQuote.ImmediateMatchAskPrice ?? optimalQuote.RecommendedOptimalPrice:N0}원 / 매도 {optimalQuote.ImmediateMatchBidPrice ?? optimalQuote.RecommendedOptimalPrice:N0}원]"
-            : "";
-        yield return Event("STEP-4", _optimalQuoteAgent, "COMPLETED",
-            quoteExecution.CopilotReasoning ?? $"상생 최적 대기호가 {optimalQuote.RecommendedOptimalPrice:N0}원 (농부 +{optimalQuote.FarmerExtraGainAmount:N0}원 / 소비자 -{optimalQuote.ConsumerSavedAmount:N0}원){immediateInfo}",
-            optimalQuote, quoteExecution);
-
-        var adoptedCandidate = baitSummary.Candidates.FirstOrDefault(c => c.IsPassed && c.Effective3KgOr5KgPrice == baitSummary.VerifiedRetailLowestPrice)
-            ?? baitSummary.Candidates.FirstOrDefault(c => c.IsPassed);
-        bool hasSourceProvenance = !string.IsNullOrWhiteSpace(wholesale.SourceUrl)
-            && adoptedCandidate is not null
-            && !string.IsNullOrWhiteSpace(adoptedCandidate.SourceUrl);
-
-        async Task<AgentToolBatchResult> AuditAsync() => await RunAgentStepAsync(
-            _auditorGuardrailAgent,
-            upstreamAgent: _optimalQuoteAgent.Name!,
-            objective: "상생 가격 부등식, 100원 호가 단위, 미끼 필터링, 스펙 일치 및 출처 불변식을 교차 감사한다.",
-            state: new Dictionary<string, object?>
-            {
-                ["wholesalePrice"] = wholesale.WholesalePrice,
-                ["optimalPrice"] = optimalQuote.RecommendedOptimalPrice,
-                ["retailLowestPrice"] = baitSummary.VerifiedRetailLowestPrice,
-                ["rejectedBaitCount"] = baitSummary.RejectedBaitCount,
-                ["adoptedBrix"] = adoptedCandidate?.GuaranteedBrix,
-                ["targetMinBrix"] = spec.MinBrix,
-                ["adoptedGrade"] = adoptedCandidate?.GradeText,
-                ["targetGrade"] = spec.Grade,
-                ["hasSourceProvenance"] = hasSourceProvenance,
-                ["adoptedSourceUrl"] = adoptedCandidate?.SourceUrl
-            },
-            cancellationToken);
-
-        const int maxRetries = 2;
-        var auditExecution = await AuditAsync();
-        var audit = auditExecution.Read<AuditResult>("audit_quote_invariants");
-        for (int retry = 1; !audit.AuditPassed && retry <= maxRetries; retry++)
+        async Task<AgentToolBatchResult> RunStagedStepAsync(ChatClientAgent agent, string upstreamAgent,
+            string objective, Dictionary<string, object?> state, CancellationToken token)
         {
-            yield return Event("STEP-5", _auditorGuardrailAgent, "AUDIT_RETRY",
-                $"감사 실패: 안전 가격 경계로 재산출 ({retry}/{maxRetries})", audit, auditExecution);
-            quoteExecution = await QuoteAsync(true);
-            optimalQuote = quoteExecution.Read<OptimalQuoteResult>("compute_win_win_optimal_quote");
+            // Scope each awaited step separately: AsyncLocal state must not escape an SSE yield.
+            using var scope = _tools.UseVerificationWorkspace(workspace);
+            return await RunAgentStepAsync(agent, upstreamAgent, objective, state, token);
+        }
+
+        try
+        {
+            var discovery = await RunStagedStepAsync(
+                _priceDiscoveryAgent,
+                upstreamAgent: _specNormalizerAgent.Name!,
+                objective: "표준 티커에 해당하는 온라인 소매 후보군(5건 이상)과 공영도매시장 기준가를 수집한다.",
+                state: new Dictionary<string, object?>
+                {
+                    ["tickerCode"] = spec.TickerCode,
+                    ["normalizedSpec"] = spec
+                },
+                cancellationToken);
+            var listings = discovery.Read<List<EcommerceCandidate>>("search_ecommerce_listings");
+            var wholesale = discovery.Read<WholesaleBenchmarkResult>("fetch_wholesale_benchmark");
+            yield return Event("STEP-2", _priceDiscoveryAgent, "COMPLETED",
+                discovery.CopilotReasoning ?? $"원본 소매 후보 {listings.Count}건, 산지 도매 기준가 {wholesale.WholesalePrice:N0}원 확보",
+                new { wholesale, candidateCount = listings.Count }, discovery);
+
+            var verification = await RunStagedStepAsync(
+                _baitVerifierAgent,
+                upstreamAgent: _priceDiscoveryAgent.Name!,
+                objective: "모든 소매 후보의 실질 환산가를 계산하고 4-Gate 미끼 필터링을 수행해 실질 최저가를 확정한다.",
+                state: new Dictionary<string, object?>
+                {
+                    ["tickerCode"] = spec.TickerCode,
+                    ["targetWeightKg"] = spec.WeightKg,
+                    ["candidates"] = listings,
+                    ["wholesalePrice"] = wholesale.WholesalePrice
+                },
+                cancellationToken);
+            var baitSummary = verification.Read<BaitVerificationSummary>("verify_four_gate_lowest_price");
+            yield return Event("STEP-3", _baitVerifierAgent, "COMPLETED",
+                verification.CopilotReasoning ?? $"4-Gate 검증: {baitSummary.RejectedBaitCount}건 제외, 실질 최저가 {baitSummary.VerifiedRetailLowestPrice:N0}원 채택",
+                baitSummary, verification);
+
+            async Task<AgentToolBatchResult> QuoteAsync(bool retry) => await RunStagedStepAsync(
+                _optimalQuoteAgent,
+                upstreamAgent: _baitVerifierAgent.Name!,
+                objective: "현재 호가창 잔량(OBI)을 조회하고 상생 가격 밴드 내 최적 추천 호가와 즉시체결 호가를 계산한다.",
+                state: new Dictionary<string, object?>
+                {
+                    ["tickerCode"] = spec.TickerCode,
+                    ["minimumPrice"] = retry ? (int?)(wholesale.WholesalePrice + 500) : null,
+                    ["maximumPrice"] = retry ? (int?)(baitSummary.VerifiedRetailLowestPrice - 500) : null,
+                    ["wholesalePrice"] = wholesale.WholesalePrice,
+                    ["verifiedRetailLowestPrice"] = baitSummary.VerifiedRetailLowestPrice
+                },
+                cancellationToken);
+
+            var quoteExecution = await QuoteAsync(false);
+            var optimalQuote = quoteExecution.Read<OptimalQuoteResult>("compute_win_win_optimal_quote");
+            var immediateInfo = optimalQuote.ImmediateMatchAskPrice.HasValue || optimalQuote.ImmediateMatchBidPrice.HasValue
+                ? $" [즉시체결 매수 {optimalQuote.ImmediateMatchAskPrice ?? optimalQuote.RecommendedOptimalPrice:N0}원 / 매도 {optimalQuote.ImmediateMatchBidPrice ?? optimalQuote.RecommendedOptimalPrice:N0}원]"
+                : "";
             yield return Event("STEP-4", _optimalQuoteAgent, "COMPLETED",
-                $"안전 경계 적용 재산출: {optimalQuote.RecommendedOptimalPrice:N0}원", optimalQuote, quoteExecution);
-            auditExecution = await AuditAsync();
-            audit = auditExecution.Read<AuditResult>("audit_quote_invariants");
-        }
+                "[감사 대기] " + (quoteExecution.CopilotReasoning ?? $"상생 최적 대기호가 {optimalQuote.RecommendedOptimalPrice:N0}원 (농부 +{optimalQuote.FarmerExtraGainAmount:N0}원 / 소비자 -{optimalQuote.ConsumerSavedAmount:N0}원){immediateInfo}"),
+                optimalQuote, quoteExecution);
 
-        if (!audit.AuditPassed)
+            var adoptedCandidate = baitSummary.Candidates.FirstOrDefault(c => c.IsPassed && c.Effective3KgOr5KgPrice == baitSummary.VerifiedRetailLowestPrice)
+                ?? baitSummary.Candidates.FirstOrDefault(c => c.IsPassed);
+            bool hasSourceProvenance = !string.IsNullOrWhiteSpace(wholesale.SourceUrl)
+                && adoptedCandidate is not null
+                && !string.IsNullOrWhiteSpace(adoptedCandidate.SourceUrl);
+
+            async Task<AgentToolBatchResult> AuditAsync() => await RunStagedStepAsync(
+                _auditorGuardrailAgent,
+                upstreamAgent: _optimalQuoteAgent.Name!,
+                objective: "상생 가격 부등식, 100원 호가 단위, 미끼 필터링, 스펙 일치 및 출처 불변식을 교차 감사한다.",
+                state: new Dictionary<string, object?>
+                {
+                    ["wholesalePrice"] = wholesale.WholesalePrice,
+                    ["optimalPrice"] = optimalQuote.RecommendedOptimalPrice,
+                    ["retailLowestPrice"] = baitSummary.VerifiedRetailLowestPrice,
+                    ["rejectedBaitCount"] = baitSummary.RejectedBaitCount,
+                    ["adoptedBrix"] = adoptedCandidate?.GuaranteedBrix,
+                    ["targetMinBrix"] = spec.MinBrix,
+                    ["adoptedGrade"] = adoptedCandidate?.GradeText,
+                    ["targetGrade"] = spec.Grade,
+                    ["hasSourceProvenance"] = hasSourceProvenance,
+                    ["adoptedSourceUrl"] = adoptedCandidate?.SourceUrl
+                },
+                cancellationToken);
+
+            const int maxRetries = 2;
+            var auditExecution = await AuditAsync();
+            var audit = auditExecution.Read<AuditResult>("audit_quote_invariants");
+            for (int retry = 1; !audit.AuditPassed && retry <= maxRetries; retry++)
+            {
+                yield return Event("STEP-5", _auditorGuardrailAgent, "AUDIT_RETRY",
+                    $"감사 실패: 안전 가격 경계로 재산출 ({retry}/{maxRetries})", audit, auditExecution);
+                quoteExecution = await QuoteAsync(true);
+                optimalQuote = quoteExecution.Read<OptimalQuoteResult>("compute_win_win_optimal_quote");
+                yield return Event("STEP-4", _optimalQuoteAgent, "COMPLETED",
+                    $"[감사 대기] 안전 경계 적용 재산출: {optimalQuote.RecommendedOptimalPrice:N0}원", optimalQuote, quoteExecution);
+                auditExecution = await AuditAsync();
+                audit = auditExecution.Read<AuditResult>("audit_quote_invariants");
+            }
+
+            cancellationToken.ThrowIfCancellationRequested();
+            if (audit.AuditPassed)
+            {
+                committed = _tools.TryCommitVerification(checkpoint, baitSummary, optimalQuote);
+                if (!committed)
+                    audit = audit with
+                    {
+                        AuditPassed = false,
+                        AuditVerdict = "AUDIT_REJECTED: 감사 중 시장 상태가 변경되어 확정하지 않았습니다. 최신 호가창으로 재검증하세요."
+                    };
+            }
+            if (!committed)
+            {
+                optimalQuote = optimalQuote with { RecommendedOptimalPrice = 0 };
+            }
+
+            finalEvent = Event("STEP-5", _auditorGuardrailAgent, audit.AuditPassed ? "AUDIT_PASSED" : "AUDIT_FAILED",
+                audit.AuditVerdict, new { spec, baitVerification = baitSummary, optimalQuote, audit }, auditExecution);
+        }
+        finally
         {
-            _tools.RestoreCheckpoint(spec.TickerCode, checkpoint);
-            optimalQuote = optimalQuote with { RecommendedOptimalPrice = 0 };
+            // Exceptions, cancellation and early stream disposal roll back only the private workspace.
+            // The live market stays unchanged, including concurrent trades and wallet reservations.
+            if (!committed)
+                _tools.RestoreCheckpoint(spec.TickerCode, checkpoint, workspace);
         }
-
-        yield return Event("STEP-5", _auditorGuardrailAgent, audit.AuditPassed ? "AUDIT_PASSED" : "AUDIT_FAILED",
-            audit.AuditVerdict, new { spec, baitVerification = baitSummary, optimalQuote, audit }, auditExecution);
+        yield return finalEvent;
     }
 
     public NaturalSellerQuoteResponse AnalyzeNaturalSellerInput(string rawInput) =>

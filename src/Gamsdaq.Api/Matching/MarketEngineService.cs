@@ -22,6 +22,7 @@ public class MarketEngineService
     private int _orderSeq;
     private int _tradeSeq;
     private int _reservedBalance;
+    private long _verificationVersion;
 
     private readonly Dictionary<string, ProduceTicker> _tickers = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, SortedDictionary<int, LinkedList<OrderQueueEntry>>> _asks = new(StringComparer.OrdinalIgnoreCase);
@@ -358,25 +359,100 @@ public class MarketEngineService
         }
     }
 
-    public (ProduceTicker Ticker, List<EcommerceCandidate> VerifiedCandidates) CaptureVerificationCheckpoint(string code)
+    public sealed record VerificationCheckpoint(
+        ProduceTicker Ticker,
+        IReadOnlyList<EcommerceCandidate> VerifiedCandidates,
+        IReadOnlyList<OrderQueueEntry> AskOrders,
+        IReadOnlyList<OrderQueueEntry> BidOrders,
+        int CashBalance,
+        int ReservedCashBalance,
+        IReadOnlyList<EcommerceCandidate> Candidates,
+        IReadOnlyList<TradeRecord> Trades,
+        long Version);
+
+    private static List<EcommerceCandidate> CopyCandidates(IEnumerable<EcommerceCandidate> candidates) =>
+        candidates.Select(candidate => candidate with { RejectionCodes = candidate.RejectionCodes?.ToArray() }).ToList();
+
+    private static SortedDictionary<int, LinkedList<OrderQueueEntry>> CopyBook(IEnumerable<OrderQueueEntry> orders) =>
+        new(orders.GroupBy(order => order.Price).ToDictionary(group => group.Key,
+            group => new LinkedList<OrderQueueEntry>(group.Select(order => order with { }))));
+
+    public VerificationCheckpoint CaptureVerificationCheckpoint(string code)
     {
         lock (_sync)
         {
             var ticker = GetTicker(code);
-            var verified = _verifiedCandidates.GetValueOrDefault(ticker.Code)?.ToList() ?? [];
-            return (ticker, verified);
+            return new VerificationCheckpoint(
+                ticker with { },
+                CopyCandidates(_verifiedCandidates.GetValueOrDefault(ticker.Code) ?? []).AsReadOnly(),
+                _asks[ticker.Code].Values.SelectMany(queue => queue).Select(order => order with { }).ToList().AsReadOnly(),
+                _bids[ticker.Code].Values.SelectMany(queue => queue).Select(order => order with { }).ToList().AsReadOnly(),
+                _virtualBalance, _reservedBalance,
+                CopyCandidates(_candidates[ticker.Code]).AsReadOnly(),
+                _trades[ticker.Code].Select(trade => trade with { }).ToList().AsReadOnly(),
+                _verificationVersion);
         }
     }
 
-    public void RestoreVerificationCheckpoint(
-        string code,
-        (ProduceTicker Ticker, List<EcommerceCandidate> VerifiedCandidates) checkpoint)
+    public void RestoreVerificationCheckpoint(string code, VerificationCheckpoint checkpoint)
     {
         lock (_sync)
         {
             var ticker = GetTicker(code);
+            if (!ticker.Code.Equals(checkpoint.Ticker.Code, StringComparison.OrdinalIgnoreCase))
+                throw new ArgumentException("체크포인트의 티커가 일치하지 않습니다.", nameof(checkpoint));
+
+            // Build all deep copies before changing any live field.
+            var verified = CopyCandidates(checkpoint.VerifiedCandidates);
+            var asks = CopyBook(checkpoint.AskOrders);
+            var bids = CopyBook(checkpoint.BidOrders);
             _tickers[ticker.Code] = checkpoint.Ticker;
-            _verifiedCandidates[ticker.Code] = checkpoint.VerifiedCandidates.ToList();
+            _verifiedCandidates[ticker.Code] = verified;
+            _asks[ticker.Code] = asks;
+            _bids[ticker.Code] = bids;
+            _virtualBalance = checkpoint.CashBalance;
+            _reservedBalance = checkpoint.ReservedCashBalance;
+            _verificationVersion++;
+        }
+    }
+
+    private MarketEngineService(VerificationCheckpoint checkpoint)
+    {
+        var code = checkpoint.Ticker.Code;
+        _tickers[code] = checkpoint.Ticker;
+        _candidates[code] = CopyCandidates(checkpoint.Candidates);
+        _trades[code] = checkpoint.Trades.Select(trade => trade with { }).ToList();
+        RestoreVerificationCheckpoint(code, checkpoint);
+    }
+
+    public MarketEngineService CreateVerificationWorkspace(VerificationCheckpoint checkpoint) => new(checkpoint);
+
+    public bool TryCommitVerification(VerificationCheckpoint checkpoint, BaitVerificationSummary summary, OptimalQuoteResult quote)
+    {
+        lock (_sync)
+        {
+            // Never overwrite orders placed while the model/auditor was running.
+            if (_verificationVersion != checkpoint.Version) return false;
+            var code = checkpoint.Ticker.Code;
+            if (summary.TickerCode != code || quote.TickerCode != code ||
+                quote.WholesaleFloorPrice != checkpoint.Ticker.WholesalePrice ||
+                quote.VerifiedRetailCeilingPrice != summary.VerifiedRetailLowestPrice ||
+                quote.RecommendedOptimalPrice <= quote.WholesaleFloorPrice ||
+                quote.RecommendedOptimalPrice >= quote.VerifiedRetailCeilingPrice ||
+                quote.RecommendedOptimalPrice % 100 != 0)
+                throw new InvalidOperationException("감사 결과와 확정할 가격 밴드가 일치하지 않습니다.");
+
+            try
+            {
+                UpdateVerifiedMarket(summary);
+                _tickers[code] = _tickers[code] with { AiOptimalPrice = quote.RecommendedOptimalPrice };
+                return true;
+            }
+            catch
+            {
+                RestoreVerificationCheckpoint(code, checkpoint);
+                throw;
+            }
         }
     }
 
@@ -386,6 +462,7 @@ public class MarketEngineService
         {
             var quote = ProducePricingMath.ComputeQuote(GetOrderBook(tickerCode), minimumPrice, maximumPrice);
             _tickers[quote.TickerCode] = _tickers[quote.TickerCode] with { AiOptimalPrice = quote.RecommendedOptimalPrice };
+            _verificationVersion++;
             return quote;
         }
     }
@@ -399,6 +476,7 @@ public class MarketEngineService
         catch (InvalidOperationException)
         {
             _tickers[code] = _tickers[code] with { AiOptimalPrice = 0 };
+            _verificationVersion++;
         }
     }
 

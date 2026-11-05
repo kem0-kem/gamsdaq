@@ -619,6 +619,69 @@ public class GamsdaqEngineTests
     }
 
     [Fact]
+    public void VerificationCheckpoint_RestoresPrunedFifoOrdersPartialQuantitiesAndAllWalletCash()
+    {
+        var engine = new MarketEngineService(1_000_000);
+        Assert.True(Submit(engine, "BUY", 12_300, 40).Success);
+        Assert.True(engine.SubmitOrder(new SubmitOrderRequest(Bansi, "BUY", "LIMIT", 18_300, 10, true)).Success);
+        Assert.True(Submit(engine, "SELL", 12_300, 94).Success);
+        var remaining = Assert.Single(engine.GetOrderQueue(Gyul, "BUY", 12_300));
+        Assert.Equal(38, remaining.Quantity);
+        var checkpoint = engine.CaptureVerificationCheckpoint(Gyul);
+        var otherBook = JsonSerializer.Serialize(engine.GetOrderBook(Bansi));
+        var wallet = JsonSerializer.Serialize(engine.GetWalletAndCart());
+        Assert.Equal(38 * 12_300 + 10 * 18_300, checkpoint.ReservedCashBalance);
+
+        new GamsdaqTools(engine).VerifyFourGateLowestPriceTool(Gyul, [Candidate() with { ListedPrice = 12_000 }]);
+        Assert.Empty(engine.GetOrderQueue(Gyul, "BUY", 12_300));
+        Assert.Equal(10 * 18_300, engine.CaptureVerificationCheckpoint(Gyul).ReservedCashBalance);
+
+        engine.RestoreVerificationCheckpoint(Gyul, checkpoint);
+        AssertVerificationStateEqual(checkpoint, engine.CaptureVerificationCheckpoint(Gyul));
+        Assert.Equal(remaining, Assert.Single(engine.GetOrderQueue(Gyul, "BUY", 12_300)));
+        Assert.Equal(otherBook, JsonSerializer.Serialize(engine.GetOrderBook(Bansi)));
+        Assert.Equal(wallet, JsonSerializer.Serialize(engine.GetWalletAndCart()));
+        Assert.False(Submit(engine, "BUY", 12_300, 30).Success);
+
+        // Restoring again must not reuse a mutable queue from a previous restore.
+        new GamsdaqTools(engine).VerifyFourGateLowestPriceTool(Gyul, [Candidate() with { ListedPrice = 12_000 }]);
+        engine.RestoreVerificationCheckpoint(Gyul, checkpoint);
+        AssertVerificationStateEqual(checkpoint, engine.CaptureVerificationCheckpoint(Gyul));
+    }
+
+    [Fact]
+    public void VerificationCheckpoint_RejectsWrongTickerWithoutChangingMarket()
+    {
+        var engine = new MarketEngineService();
+        var before = engine.CaptureVerificationCheckpoint(Bansi);
+        Assert.Throws<ArgumentException>(() => engine.RestoreVerificationCheckpoint(Bansi, engine.CaptureVerificationCheckpoint(Gyul)));
+        AssertVerificationStateEqual(before, engine.CaptureVerificationCheckpoint(Bansi));
+    }
+
+    [Fact]
+    public void OptimalQuote_BansiAdditionalTwoHundredAsks_RecomputesTo19300()
+    {
+        var engine = new MarketEngineService();
+        Assert.Equal(19_500, engine.GetTicker(Bansi).AiOptimalPrice);
+        var response = engine.SubmitOrder(new SubmitOrderRequest(Bansi, "SELL", "LIMIT", 19_300, 200, true));
+        Assert.True(response.Success);
+        Assert.Equal(589, response.UpdatedOrderBook.TotalAskQuantity);
+        Assert.Equal(290, response.UpdatedOrderBook.TotalBidQuantity);
+        Assert.Equal(19_300, response.UpdatedOrderBook.Ticker.AiOptimalPrice);
+    }
+
+    private static void AssertVerificationStateEqual(MarketEngineService.VerificationCheckpoint expected,
+        MarketEngineService.VerificationCheckpoint actual)
+    {
+        Assert.Equal(expected.Ticker, actual.Ticker);
+        Assert.Equal(JsonSerializer.Serialize(expected.VerifiedCandidates), JsonSerializer.Serialize(actual.VerifiedCandidates));
+        Assert.Equal(expected.AskOrders.ToArray(), actual.AskOrders.ToArray());
+        Assert.Equal(expected.BidOrders.ToArray(), actual.BidOrders.ToArray());
+        Assert.Equal(expected.CashBalance, actual.CashBalance);
+        Assert.Equal(expected.ReservedCashBalance, actual.ReservedCashBalance);
+    }
+
+    [Fact]
     public async Task ConcurrentBuys_DoNotOverfillOrLoseQuantity()
     {
         var engine = new MarketEngineService(20_000_000);
@@ -788,6 +851,55 @@ public class GamsdaqEngineTests
         Assert.Equal(1, invoked);
     }
 
+    [Theory]
+    [InlineData(false, "live", "COPILOT_SDK_SYNTHESIS_WITH_AIFUNCTION")]
+    [InlineData(true, "live", "COPILOT_SDK_MODEL_DIRECTED_AIFUNCTION")]
+    [InlineData(false, "", "DETERMINISTIC_AIFUNCTION")]
+    [InlineData(true, "", "COPILOT_SDK_MODEL_DIRECTED_AIFUNCTION")]
+    [InlineData(false, "failure", "DETERMINISTIC_AIFUNCTION")]
+    [InlineData(true, "failure", "COPILOT_SDK_MODEL_DIRECTED_AIFUNCTION")]
+    public async Task Adapter_ReportsToolSelectionSeparatelyFromLiveSynthesis(bool modelSelected, string synthesis, string expectedMode)
+    {
+        int invoked = 0;
+        using var adapter = new CopilotSdkChatClientAdapter(
+            NullLogger<CopilotSdkChatClientAdapter>.Instance,
+            (_, _, _) => Task.FromResult<ToolInvocationPlan?>(modelSelected
+                ? new ToolInvocationPlan([new ToolInvocationRequest("counter", new Dictionary<string, object?>())])
+                : null),
+            (summary, _) =>
+            {
+                Assert.Contains("counter", summary);
+                return synthesis == "failure"
+                    ? Task.FromException<string?>(new InvalidOperationException("synthesis unavailable"))
+                    : Task.FromResult<string?>(synthesis);
+            });
+        var response = await adapter.GetResponseAsync([new ChatMessage(ChatRole.User, "run")],
+            new ChatOptions { Tools = [AIFunctionFactory.Create(() => ++invoked, "counter")] });
+        var batch = JsonSerializer.Deserialize<AgentToolBatchResult>(response.Messages.Last().Text,
+            new JsonSerializerOptions(JsonSerializerDefaults.Web))!;
+        Assert.Equal(expectedMode, batch.ExecutionMode);
+        Assert.Equal(expectedMode, response.AdditionalProperties!["executionMode"]);
+        Assert.Equal(synthesis == "live" ? synthesis : null, batch.CopilotReasoning);
+        Assert.Equal(1, invoked);
+    }
+
+    [Fact]
+    public async Task Adapter_DoesNotSwallowCancellationDuringSynthesis()
+    {
+        using var cancellation = new CancellationTokenSource();
+        using var adapter = new CopilotSdkChatClientAdapter(
+            NullLogger<CopilotSdkChatClientAdapter>.Instance,
+            (_, _, _) => Task.FromResult<ToolInvocationPlan?>(null),
+            (_, token) =>
+            {
+                cancellation.Cancel();
+                return Task.FromCanceled<string?>(token);
+            });
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => adapter.GetResponseAsync(
+            [new ChatMessage(ChatRole.User, "run")],
+            new ChatOptions { Tools = [AIFunctionFactory.Create(() => 1, "counter")] }, cancellation.Token));
+    }
+
     [Fact]
     public void ToolSets_ExposeEveryRequiredAIFunctionName()
     {
@@ -918,6 +1030,179 @@ public class GamsdaqEngineTests
         Assert.Equal(initialOptimal, engine.GetTicker(Gyul).AiOptimalPrice);
         var failedPayload = JsonSerializer.SerializeToElement(events[^1].Payload);
         Assert.Equal(0, failedPayload.GetProperty("optimalQuote").GetProperty("RecommendedOptimalPrice").GetInt32());
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task AgentPipeline_IsolatesPruningUntilAuditAndCommitsOnlyPassedResults(bool rejectAudit)
+    {
+        var engine = new MarketEngineService();
+        Assert.True(Submit(engine, "BUY", 12_300, 40).Success);
+        var before = engine.CaptureVerificationCheckpoint(Gyul);
+        var tools = new NarrowVerificationTools(engine, rejectAudit ? "reject" : "");
+        using var adapter = new CopilotSdkChatClientAdapter(NullLogger<CopilotSdkChatClientAdapter>.Instance);
+        var orchestrator = new CopilotAgentOrchestrator(adapter, tools, NullLoggerFactory.Instance);
+        var events = new List<AgentStreamEvent>();
+        await foreach (var item in orchestrator.RunVerificationStreamAsync(new AgentVerifyRequest("감귤 3kg", "BUYER", Gyul)))
+        {
+            events.Add(item);
+            if (item.Status != "AUDIT_PASSED")
+                AssertVerificationStateEqual(before, engine.CaptureVerificationCheckpoint(Gyul));
+            if (item.StepId == "STEP-3")
+            {
+                Assert.Equal(12_000, tools.PrunedBook!.Ticker.VerifiedRetailLowestPrice);
+                Assert.DoesNotContain(tools.PrunedBook.Bids, level => level.Price >= 12_000);
+            }
+            if (item.StepId == "STEP-4")
+                Assert.StartsWith("[감사 대기]", item.Summary);
+        }
+
+        if (rejectAudit)
+        {
+            Assert.Equal("AUDIT_FAILED", events[^1].Status);
+            Assert.Equal(1, tools.RestoreCalls);
+            AssertVerificationStateEqual(before, tools.RestoredWorkspace!);
+            Assert.False(Submit(engine, "BUY", 12_400, 1).Success);
+        }
+        else
+        {
+            Assert.Equal(new[] { "STEP-1", "STEP-2", "STEP-3", "STEP-4", "STEP-5" }, events.Select(item => item.StepId));
+            Assert.Equal("AUDIT_PASSED", events[^1].Status);
+            Assert.Equal(0, tools.RestoreCalls);
+            Assert.Equal(12_000, engine.GetTicker(Gyul).VerifiedRetailLowestPrice);
+            Assert.Equal(Assert.IsType<OptimalQuoteResult>(events[3].Payload).RecommendedOptimalPrice,
+                engine.GetTicker(Gyul).AiOptimalPrice);
+            Assert.Equal(0, engine.CaptureVerificationCheckpoint(Gyul).ReservedCashBalance);
+            Assert.Empty(engine.GetOrderQueue(Gyul, "BUY", 12_300));
+            Assert.True(Submit(engine, "BUY", 11_900, 40).Success);
+        }
+    }
+
+    [Theory]
+    [InlineData("verify")]
+    [InlineData("quote")]
+    [InlineData("audit")]
+    public async Task AgentPipeline_ExceptionAfterPruningRestoresOrdersAndReservedCash(string failure)
+    {
+        var engine = new MarketEngineService();
+        Assert.True(Submit(engine, "BUY", 12_300, 40).Success);
+        var before = engine.CaptureVerificationCheckpoint(Gyul);
+        var tools = new NarrowVerificationTools(engine, failure);
+        await Assert.ThrowsAsync<InvalidOperationException>(() => RunPipeline(tools));
+        Assert.NotNull(tools.PrunedBook);
+        Assert.Equal(1, tools.RestoreCalls);
+        AssertVerificationStateEqual(before, tools.RestoredWorkspace!);
+        AssertVerificationStateEqual(before, engine.CaptureVerificationCheckpoint(Gyul));
+        Assert.False(Submit(engine, "BUY", 12_400, 1).Success);
+    }
+
+    [Theory]
+    [InlineData("STEP-3", false)]
+    [InlineData("STEP-4", false)]
+    [InlineData("STEP-3", true)]
+    [InlineData("STEP-4", true)]
+    public async Task AgentPipeline_CancellationOrEarlyDisposalRestoresPrivateCheckpoint(string stopStep, bool cancel)
+    {
+        var engine = new MarketEngineService();
+        Assert.True(Submit(engine, "BUY", 12_300, 40).Success);
+        var before = engine.CaptureVerificationCheckpoint(Gyul);
+        var tools = new NarrowVerificationTools(engine, "");
+        using var adapter = new CopilotSdkChatClientAdapter(NullLogger<CopilotSdkChatClientAdapter>.Instance);
+        using var cancellation = new CancellationTokenSource();
+        var orchestrator = new CopilotAgentOrchestrator(adapter, tools, NullLoggerFactory.Instance);
+        await using (var stream = orchestrator.RunVerificationStreamAsync(
+            new AgentVerifyRequest("감귤 3kg", "BUYER", Gyul), cancellation.Token).GetAsyncEnumerator())
+        {
+            do { Assert.True(await stream.MoveNextAsync()); } while (stream.Current.StepId != stopStep);
+            if (cancel)
+            {
+                cancellation.Cancel();
+                await Assert.ThrowsAnyAsync<OperationCanceledException>(() => stream.MoveNextAsync().AsTask());
+            }
+        }
+        Assert.Equal(1, tools.RestoreCalls);
+        AssertVerificationStateEqual(before, tools.RestoredWorkspace!);
+        AssertVerificationStateEqual(before, engine.CaptureVerificationCheckpoint(Gyul));
+        Assert.False(Submit(engine, "BUY", 12_400, 1).Success);
+    }
+
+    [Theory]
+    [InlineData(Gyul)]
+    [InlineData(Bansi)]
+    [InlineData("RESET")]
+    public async Task AgentPipeline_ConcurrentMarketChangeRejectsStaleCommitWithoutUndoingNewState(string change)
+    {
+        var engine = new MarketEngineService();
+        var tools = new NarrowVerificationTools(engine, "");
+        using var adapter = new CopilotSdkChatClientAdapter(NullLogger<CopilotSdkChatClientAdapter>.Instance);
+        var orchestrator = new CopilotAgentOrchestrator(adapter, tools, NullLoggerFactory.Instance);
+        string? afterConcurrentChange = null;
+        AgentStreamEvent? final = null;
+        await foreach (var item in orchestrator.RunVerificationStreamAsync(new AgentVerifyRequest("감귤 3kg", "BUYER", Gyul)))
+        {
+            final = item;
+            if (item.StepId == "STEP-4")
+            {
+                if (change == "RESET") engine.ResetDemoMarket();
+                else Assert.True(engine.SubmitOrder(new SubmitOrderRequest(change, "BUY", "MARKET", 0, 1, true)).Success);
+                afterConcurrentChange = JsonSerializer.Serialize(new
+                {
+                    gyul = engine.GetOrderBook(Gyul), bansi = engine.GetOrderBook(Bansi), wallet = engine.GetWalletAndCart()
+                });
+            }
+        }
+        Assert.Equal("AUDIT_FAILED", final!.Status);
+        Assert.Contains("시장 상태가 변경", final.Summary);
+        Assert.Equal(afterConcurrentChange, JsonSerializer.Serialize(new
+        {
+            gyul = engine.GetOrderBook(Gyul), bansi = engine.GetOrderBook(Bansi), wallet = engine.GetWalletAndCart()
+        }));
+        Assert.Equal(1, tools.RestoreCalls);
+    }
+
+    private sealed class NarrowVerificationTools(MarketEngineService market, string failure) : GamsdaqTools(market)
+    {
+        public OrderBookSnapshot? PrunedBook { get; private set; }
+        public MarketEngineService.VerificationCheckpoint? RestoredWorkspace { get; private set; }
+        public int RestoreCalls { get; private set; }
+
+        public override BaitVerificationSummary VerifyFourGateLowestPriceTool(string tickerCode, List<EcommerceCandidate>? candidates = null)
+        {
+            var result = base.VerifyFourGateLowestPriceTool(tickerCode, [
+                Candidate("narrow-band") with { ListedPrice = 12_000, SourceUrl = "https://www.coupang.com/np/search?q=gyul" },
+                Candidate("bait") with { GuaranteedBrix = null }
+            ]);
+            PrunedBook = GetOrderBookSnapshotTool(tickerCode);
+            if (failure == "verify") throw new InvalidOperationException("verification failure after pruning");
+            return result;
+        }
+
+        public override OptimalQuoteResult ComputeWinWinOptimalQuoteTool(string tickerCode, int? minimumPrice = null, int? maximumPrice = null)
+        {
+            var result = base.ComputeWinWinOptimalQuoteTool(tickerCode, minimumPrice, maximumPrice);
+            if (failure == "quote") throw new InvalidOperationException("quote failure after pruning");
+            return result;
+        }
+
+        public override AuditResult AuditQuoteInvariantsTool(int wholesalePrice, int optimalPrice, int retailLowestPrice,
+            int rejectedBaitCount, int? adoptedBrix, int? targetMinBrix, string? adoptedGrade, string? targetGrade,
+            bool hasSourceProvenance, string? adoptedSourceUrl)
+        {
+            var result = base.AuditQuoteInvariantsTool(wholesalePrice, optimalPrice, retailLowestPrice, rejectedBaitCount,
+                adoptedBrix, targetMinBrix, adoptedGrade, targetGrade, hasSourceProvenance, adoptedSourceUrl);
+            if (failure == "audit") throw new InvalidOperationException("audit failure after pruning");
+            return failure == "reject" ? result with { AuditPassed = false, AuditVerdict = "AUDIT_REJECTED" } : result;
+        }
+
+        public override void RestoreCheckpoint(string tickerCode, MarketEngineService.VerificationCheckpoint checkpoint,
+            MarketEngineService? workspace = null)
+        {
+            Assert.NotNull(workspace);
+            base.RestoreCheckpoint(tickerCode, checkpoint, workspace);
+            RestoredWorkspace = workspace.CaptureVerificationCheckpoint(tickerCode);
+            RestoreCalls++;
+        }
     }
 
     private sealed class RetryQuoteTools(MarketEngineService market, bool alwaysInvalid) : GamsdaqTools(market)
