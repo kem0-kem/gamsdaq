@@ -143,7 +143,8 @@ public record NaturalSellerQuoteResponse(
     int ExpectedTotalExtraGain,
     string ReasoningSummary,
     double ElapsedMs = 0,
-    int ClicksEquivalent = 3
+    int ClicksEquivalent = 3,
+    int ExecutedAgentsCount = 5
 );
 
 public record AgentVerifyRequest(

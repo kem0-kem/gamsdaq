@@ -10,7 +10,9 @@ using OpenTelemetry.Trace;
 var builder = WebApplication.CreateBuilder(args);
 
 builder.Services.AddOpenTelemetry()
-    .WithTracing(tracing => tracing.AddSource(GamsdaqTelemetry.ActivitySourceName).AddAspNetCoreInstrumentation())
+    .WithTracing(tracing => tracing
+        .AddSource(GamsdaqTelemetry.ActivitySourceName, GamsdaqTelemetry.CopilotActivitySourceName)
+        .AddAspNetCoreInstrumentation())
     .WithMetrics(metrics => metrics.AddMeter(GamsdaqTelemetry.MeterName).AddAspNetCoreInstrumentation());
 
 if (!string.IsNullOrWhiteSpace(builder.Configuration["APPLICATIONINSIGHTS_CONNECTION_STRING"]))
@@ -29,6 +31,7 @@ builder.Services.AddSingleton<CopilotSdkChatClientAdapter>();
 builder.Services.AddSingleton<CopilotAgentOrchestrator>();
 
 var app = builder.Build();
+GamsdaqTelemetry.AttachApplicationInsights(app.Services.GetService<Microsoft.ApplicationInsights.TelemetryClient>());
 
 app.UseCors();
 app.UseDefaultFiles();
@@ -105,9 +108,9 @@ app.MapPost("/api/cart/{contractId}/ship", (string contractId, ShippingRequest r
     });
 });
 
-app.MapPost("/api/farmers/natural-quote", (NaturalSellerQuoteRequest req, CopilotAgentOrchestrator orchestrator) =>
+app.MapPost("/api/farmers/natural-quote", async (NaturalSellerQuoteRequest req, CopilotAgentOrchestrator orchestrator, CancellationToken ct) =>
 {
-    var res = orchestrator.AnalyzeNaturalSellerInput(req.NaturalText);
+    var res = await orchestrator.AnalyzeNaturalSellerInputAsync(req.NaturalText, ct);
     return Results.Ok(res);
 });
 

@@ -61,30 +61,143 @@ public class GamsdaqTools
             throw new ArgumentException(rejection, nameof(inputQuery));
         }
         inputQuery = sanitized;
-        var isBansi = inputQuery.Contains("반시", StringComparison.OrdinalIgnoreCase)
-                   || inputQuery.Contains("청도", StringComparison.OrdinalIgnoreCase)
-                   || inputQuery.Contains("감 ", StringComparison.OrdinalIgnoreCase)
-                   || inputQuery.Contains("5kg", StringComparison.OrdinalIgnoreCase)
-                   || inputQuery.Contains("다섯", StringComparison.OrdinalIgnoreCase);
+        string[] forbiddenGrades = ["파지", "못난이", "흠과", "가공용", "주스용", "하품"];
+        if (forbiddenGrades.Any(term => inputQuery.Contains(term, StringComparison.OrdinalIgnoreCase)))
+        {
+            throw new ArgumentException("파지/못난이/흠과 등 비규격 등급은 표준 티커 호가창에 등록할 수 없습니다.", nameof(inputQuery));
+        }
 
-        var ticker = LookupStandardTickerTool(tickerCode ?? (isBansi ? "CD-BANSI-13B-5KG" : "JJ-GYUL-12B-3KG"));
+        var mentionsBansi = inputQuery.Contains("반시", StringComparison.OrdinalIgnoreCase)
+                         || inputQuery.Contains("청도", StringComparison.OrdinalIgnoreCase)
+                         || inputQuery.Contains("감 ", StringComparison.OrdinalIgnoreCase);
+        var mentionsGyul = inputQuery.Contains("감귤", StringComparison.OrdinalIgnoreCase)
+                        || inputQuery.Contains("귤", StringComparison.OrdinalIgnoreCase)
+                        || inputQuery.Contains("제주", StringComparison.OrdinalIgnoreCase);
+        var isBansi = mentionsBansi || (!mentionsGyul && (
+                      inputQuery.Contains("5kg", StringComparison.OrdinalIgnoreCase)
+                   || inputQuery.Contains("다섯 키로", StringComparison.OrdinalIgnoreCase)
+                   || inputQuery.Contains("다섯키로", StringComparison.OrdinalIgnoreCase)));
+
+        string resolvedTickerCode = mentionsBansi
+            ? "CD-BANSI-13B-5KG"
+            : mentionsGyul
+                ? "JJ-GYUL-12B-3KG"
+                : (tickerCode ?? (isBansi ? "CD-BANSI-13B-5KG" : "JJ-GYUL-12B-3KG"));
+        var ticker = LookupStandardTickerTool(resolvedTickerCode);
+
+        int resolvedBrix = ticker.MinBrix;
+        bool brixExtracted = false;
+        var brixMatch = System.Text.RegularExpressions.Regex.Match(inputQuery, @"(\d+)\s*(?:브릭스|brix)", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        if (brixMatch.Success && int.TryParse(brixMatch.Groups[1].Value, out var parsedBrix))
+        {
+            if (parsedBrix < ticker.MinBrix)
+            {
+                throw new ArgumentException($"입력 당도({parsedBrix}브릭스)가 표준 티커[{ticker.Code}] 최소 기준({ticker.MinBrix}브릭스)에 미달하여 거부됩니다.", nameof(inputQuery));
+            }
+            resolvedBrix = parsedBrix;
+            brixExtracted = true;
+        }
+
+        decimal resolvedWeight = ticker.WeightKg;
+        bool weightExtracted = false;
+        var weightMatch = System.Text.RegularExpressions.Regex.Match(inputQuery, @"(\d+(?:\.\d+)?)\s*(?:kg|키로|킬로)", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        if (weightMatch.Success && decimal.TryParse(weightMatch.Groups[1].Value, System.Globalization.NumberStyles.Number, System.Globalization.CultureInfo.InvariantCulture, out var parsedWeight))
+        {
+            if (parsedWeight != ticker.WeightKg)
+            {
+                throw new ArgumentException($"입력 중량({parsedWeight}kg)이 표준 티커[{ticker.Code}] 규격({ticker.WeightKg}kg)과 일치하지 않습니다.", nameof(inputQuery));
+            }
+            resolvedWeight = parsedWeight;
+            weightExtracted = true;
+        }
+        else if (System.Text.RegularExpressions.Regex.IsMatch(inputQuery, @"다섯\s*(?:키로|킬로)"))
+        {
+            if (ticker.WeightKg != 5.0m)
+            {
+                throw new ArgumentException($"입력 중량(5kg)이 표준 티커[{ticker.Code}] 규격({ticker.WeightKg}kg)과 일치하지 않습니다.", nameof(inputQuery));
+            }
+            resolvedWeight = 5.0m;
+            weightExtracted = true;
+        }
+        else if (System.Text.RegularExpressions.Regex.IsMatch(inputQuery, @"세\s*(?:키로|킬로)"))
+        {
+            if (ticker.WeightKg != 3.0m)
+            {
+                throw new ArgumentException($"입력 중량(3kg)이 표준 티커[{ticker.Code}] 규격({ticker.WeightKg}kg)과 일치하지 않습니다.", nameof(inputQuery));
+            }
+            resolvedWeight = 3.0m;
+            weightExtracted = true;
+        }
 
         var qty = 10;
+        bool qtyExtracted = false;
         var match = System.Text.RegularExpressions.Regex.Match(inputQuery, @"(\d+)\s*(?:박스|상자|개)");
         if (match.Success && int.TryParse(match.Groups[1].Value, out var parsedQty))
         {
             qty = Math.Clamp(parsedQty, 1, 1000);
+            qtyExtracted = true;
         }
+        else if (TryParseColloquialBoxCount(inputQuery, out var wordQty))
+        {
+            qty = wordQty;
+            qtyExtracted = true;
+        }
+
+        var extracted = new List<string>();
+        var defaulted = new List<string>();
+        void Classify(string field, bool present) => (present ? extracted : defaulted).Add(field);
+
+        Classify("crop", inputQuery.Contains("감귤", StringComparison.OrdinalIgnoreCase)
+                      || inputQuery.Contains("귤", StringComparison.OrdinalIgnoreCase)
+                      || inputQuery.Contains("반시", StringComparison.OrdinalIgnoreCase)
+                      || inputQuery.Contains("감", StringComparison.OrdinalIgnoreCase));
+        Classify("origin", inputQuery.Contains("제주", StringComparison.OrdinalIgnoreCase)
+                        || inputQuery.Contains("서귀포", StringComparison.OrdinalIgnoreCase)
+                        || inputQuery.Contains("청도", StringComparison.OrdinalIgnoreCase)
+                        || inputQuery.Contains("경북", StringComparison.OrdinalIgnoreCase));
+        Classify("minBrix", brixExtracted);
+        Classify("weightKg", weightExtracted);
+        Classify("grade", inputQuery.Contains("특", StringComparison.OrdinalIgnoreCase)
+                       || inputQuery.Contains("로얄", StringComparison.OrdinalIgnoreCase)
+                       || inputQuery.Contains("대과", StringComparison.OrdinalIgnoreCase)
+                       || inputQuery.Contains("명품", StringComparison.OrdinalIgnoreCase));
+        Classify("quantity", qtyExtracted);
 
         return new NormalizedSpecResult(
             TickerCode: ticker.Code,
             StandardName: ticker.Name,
             Origin: ticker.Origin,
-            MinBrix: ticker.MinBrix,
-            WeightKg: ticker.WeightKg,
+            MinBrix: resolvedBrix,
+            WeightKg: resolvedWeight,
             Grade: ticker.Grade,
-            ExtractedQuantity: qty
+            ExtractedQuantity: qty,
+            ExtractedFields: extracted,
+            DefaultMappedFields: defaulted
         );
+    }
+
+    private static bool TryParseColloquialBoxCount(string text, out int count)
+    {
+        (string Pattern, int Value)[] colloquial =
+        [
+            (@"스무\s*(?:박스|상자|개)", 20),
+            (@"열\s*(?:박스|상자|개)", 10),
+            (@"다섯\s*(?:박스|상자|개)", 5),
+            (@"네\s*(?:박스|상자|개)", 4),
+            (@"세\s*(?:박스|상자|개)", 3),
+            (@"두\s*(?:박스|상자|개)", 2),
+            (@"한\s*(?:박스|상자|개)", 1)
+        ];
+        foreach (var (pattern, val) in colloquial)
+        {
+            if (System.Text.RegularExpressions.Regex.IsMatch(text, pattern))
+            {
+                count = val;
+                return true;
+            }
+        }
+        count = 0;
+        return false;
     }
 
     public ProduceTicker LookupStandardTickerTool(string tickerCode) => _market.GetTicker(tickerCode);
@@ -134,6 +247,15 @@ public class GamsdaqTools
 
     public OrderBookSnapshot GetOrderBookSnapshotTool(string tickerCode) => _market.GetOrderBook(tickerCode);
 
+    public (ProduceTicker Ticker, List<EcommerceCandidate> VerifiedCandidates) CaptureCheckpoint(string tickerCode) =>
+        _market.CaptureVerificationCheckpoint(tickerCode);
+
+    public void RestoreCheckpoint(string tickerCode, (ProduceTicker Ticker, List<EcommerceCandidate> VerifiedCandidates) checkpoint) =>
+        _market.RestoreVerificationCheckpoint(tickerCode, checkpoint);
+
+    private static readonly string[] TrustedSourceDomains =
+        ["coupang.com", "naver.com", "11st.co.kr", "gmarket.co.kr", "ssg.com", "kamis.or.kr"];
+
     [Description("도매 기준가, 인터넷 최저가, 호가창 잔량을 바탕으로 상생 최적 호가를 결정론적으로 산출합니다.")]
     public virtual OptimalQuoteResult ComputeWinWinOptimalQuoteTool(
         [Description("표준 티커 코드")] string tickerCode,
@@ -164,7 +286,10 @@ public class GamsdaqTools
         bool inv5Source = hasSourceProvenance
             && !string.IsNullOrWhiteSpace(adoptedSourceUrl)
             && Uri.TryCreate(adoptedSourceUrl, UriKind.Absolute, out var uri)
-            && uri.Scheme == Uri.UriSchemeHttps;
+            && uri.Scheme == Uri.UriSchemeHttps
+            && TrustedSourceDomains.Any(domain =>
+                uri.Host.Equals(domain, StringComparison.OrdinalIgnoreCase) ||
+                uri.Host.EndsWith("." + domain, StringComparison.OrdinalIgnoreCase));
 
         bool passed = inv1 && inv2 && inv3 && inv4Spec && inv5Source;
         return new AuditResult(
@@ -206,7 +331,9 @@ public record NormalizedSpecResult(
     int MinBrix,
     decimal WeightKg,
     string Grade,
-    int ExtractedQuantity
+    int ExtractedQuantity,
+    IReadOnlyList<string>? ExtractedFields = null,
+    IReadOnlyList<string>? DefaultMappedFields = null
 );
 
 public record WholesaleBenchmarkResult(
@@ -237,7 +364,10 @@ public record OptimalQuoteResult(
     int ConsumerSavedAmount,
     double ConsumerSavedPercent,
     int FarmerExtraGainAmount,
-    double FarmerExtraGainPercent
+    double FarmerExtraGainPercent,
+    int? ImmediateMatchAskPrice = null,
+    int? ImmediateMatchBidPrice = null,
+    int? RestingLimitQuotePrice = null
 );
 
 public record AuditResult(

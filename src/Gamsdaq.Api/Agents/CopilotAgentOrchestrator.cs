@@ -13,6 +13,7 @@ namespace Gamsdaq.Api.Agents;
 
 public record ToolInvocationRequest(string ToolName, Dictionary<string, object?> Arguments);
 public record ToolInvocationPlan(List<ToolInvocationRequest> Calls, string? UpstreamAgent = null, object? HandoffContext = null);
+public record AgentHandoffEnvelope(string UpstreamAgent, string DownstreamAgent, string Objective, Dictionary<string, object?> State);
 
 public record AgentToolBatchResult(string ExecutionMode, double LatencyMs, List<AgentToolExecution> ToolCalls, string? CopilotReasoning = null)
 {
@@ -29,7 +30,7 @@ public sealed class CopilotSdkChatClientAdapter : IChatClient, IAsyncDisposable
 {
     internal static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
     private readonly ILogger<CopilotSdkChatClientAdapter> _logger;
-    private readonly Lazy<CopilotClient> _copilotClient = new(() => new CopilotClient(new CopilotClientOptions()));
+    private readonly Lazy<CopilotClient> _copilotClient;
     private readonly Func<IReadOnlyList<ChatMessage>, IReadOnlyDictionary<string, AIFunction>, CancellationToken, Task<ToolInvocationPlan?>>? _modelToolPlanner;
     private int _disposed;
 
@@ -41,7 +42,51 @@ public sealed class CopilotSdkChatClientAdapter : IChatClient, IAsyncDisposable
     {
         _logger = logger;
         _modelToolPlanner = modelToolPlanner;
+        _copilotClient = new Lazy<CopilotClient>(() => new CopilotClient(new CopilotClientOptions
+        {
+            GitHubToken = ResolveGitHubToken(),
+            Logger = _logger,
+            Telemetry = new TelemetryConfig
+            {
+                SourceName = GamsdaqTelemetry.CopilotActivitySourceName
+            }
+        }));
     }
+
+    public static string? ResolveGitHubToken()
+    {
+        var token = Environment.GetEnvironmentVariable("COPILOT_GITHUB_TOKEN")
+                 ?? Environment.GetEnvironmentVariable("GITHUB_TOKEN");
+        return string.IsNullOrWhiteSpace(token) ? null : token;
+    }
+
+    public static SessionConfig BuildSessionConfig(
+        string? systemInstructions,
+        IReadOnlyDictionary<string, AIFunction> functions,
+        string model = "gpt-5") =>
+        new()
+        {
+            Model = model,
+            Tools = functions.Values.Cast<AIFunctionDeclaration>().ToList(),
+            AvailableTools = functions.Keys.ToList(),
+            OnPermissionRequest = PermissionHandler.ApproveAll,
+            SystemMessage = string.IsNullOrWhiteSpace(systemInstructions)
+                ? null
+                : new SystemMessageConfig
+                {
+                    Mode = SystemMessageMode.Append,
+                    Content = systemInstructions
+                }
+        };
+
+    public static MessageOptions BuildMessageOptions(string prompt, string? upstreamAgent = null) =>
+        new()
+        {
+            Prompt = prompt,
+            Source = !string.IsNullOrWhiteSpace(upstreamAgent)
+                ? MessageSource.Agent(upstreamAgent)
+                : MessageSource.User
+        };
 
     public ChatClientMetadata Metadata => new("GitHub.Copilot.SDK", null, "copilot-market-agent");
 
@@ -53,6 +98,7 @@ public sealed class CopilotSdkChatClientAdapter : IChatClient, IAsyncDisposable
         ObjectDisposedException.ThrowIf(_disposed != 0, this);
         cancellationToken.ThrowIfCancellationRequested();
         var history = messages.ToList();
+        var systemText = string.Join("\n", history.Where(m => m.Role == ChatRole.System).Select(m => m.Text).Where(t => !string.IsNullOrWhiteSpace(t)));
         var userText = history.LastOrDefault(message => message.Role == ChatRole.User)?.Text ?? "";
         if (options?.Tools?.Any(tool => tool is not AIFunction) == true)
         {
@@ -63,14 +109,16 @@ public sealed class CopilotSdkChatClientAdapter : IChatClient, IAsyncDisposable
         if (functions.Count == 0)
         {
             // No fictitious "verified" response if the SDK is unavailable.
-            await using var session = await _copilotClient.Value.CreateSessionAsync(new SessionConfig(), cancellationToken);
-            var reply = await session.SendAndWaitAsync(userText, TimeSpan.FromSeconds(30), cancellationToken);
+            await using var session = await _copilotClient.Value.CreateSessionAsync(
+                BuildSessionConfig(systemText, functions), cancellationToken);
+            var reply = await session.SendAndWaitAsync(
+                BuildMessageOptions(userText), TimeSpan.FromSeconds(30), cancellationToken);
             if (reply is null) throw new InvalidOperationException("Copilot SDK returned no response.");
             ConnectionStatus = "CONNECTED_COPILOT_SDK_LIVE";
             return new ChatResponse(new ChatMessage(ChatRole.Assistant, reply.Data.Content));
         }
 
-        var (plan, modelSelectedTools) = await ResolveToolPlanAsync(history, userText, functions, cancellationToken);
+        var (plan, modelSelectedTools, envelope) = await ResolveToolPlanAsync(history, systemText, userText, functions, cancellationToken);
         if (plan.Calls.Count == 0) throw new InvalidOperationException("At least one bound tool invocation is required.");
         // Validate the complete allowlist before executing even the first call.
         foreach (var call in plan.Calls)
@@ -84,13 +132,18 @@ public sealed class CopilotSdkChatClientAdapter : IChatClient, IAsyncDisposable
         var started = Stopwatch.GetTimestamp();
         var executions = new List<AgentToolExecution>();
         var responseMessages = new List<ChatMessage>();
+        var dynamicState = envelope?.State is not null
+            ? new Dictionary<string, object?>(envelope.State, StringComparer.OrdinalIgnoreCase)
+            : new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
+
         foreach (var call in plan.Calls)
         {
             cancellationToken.ThrowIfCancellationRequested();
             using var activity = GamsdaqTelemetry.ActivitySource.StartActivity($"tool.{call.ToolName}");
             activity?.SetTag("tool.name", call.ToolName);
             string callId = Guid.NewGuid().ToString("N");
-            var arguments = new AIFunctionArguments(call.Arguments);
+            var resolvedArgs = ResolveChainedArguments(call.Arguments, functions[call.ToolName], dynamicState);
+            var arguments = new AIFunctionArguments(resolvedArgs);
             var callStarted = Stopwatch.GetTimestamp();
             object? result;
             try
@@ -104,25 +157,26 @@ public sealed class CopilotSdkChatClientAdapter : IChatClient, IAsyncDisposable
                 throw;
             }
             var output = JsonSerializer.SerializeToElement(result, JsonOptions);
+            MergeToolOutputIntoState(output, dynamicState);
             var execution = new AgentToolExecution(callId, call.ToolName,
                 Stopwatch.GetElapsedTime(callStarted).TotalMilliseconds, output);
             executions.Add(execution);
             responseMessages.Add(new ChatMessage(ChatRole.Assistant, [
-                new FunctionCallContent(callId, call.ToolName, call.Arguments)]));
+                new FunctionCallContent(callId, call.ToolName, resolvedArgs)]));
             responseMessages.Add(new ChatMessage(ChatRole.Tool, [new FunctionResultContent(callId, output)]));
         }
 
         var batchMode = modelSelectedTools ? "COPILOT_SDK_MODEL_DIRECTED_AIFUNCTION" : "DETERMINISTIC_AIFUNCTION";
         string? copilotReasoning = null;
-        if (!string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("GITHUB_TOKEN"))
-            || !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("COPILOT_GITHUB_TOKEN")))
+        if (ResolveGitHubToken() is not null)
         {
             try
             {
-                await using var session = await _copilotClient.Value.CreateSessionAsync(new SessionConfig(), cancellationToken);
+                await using var session = await _copilotClient.Value.CreateSessionAsync(
+                    BuildSessionConfig(systemText, functions), cancellationToken);
                 var toolSummary = string.Join(", ", executions.Select(e => $"{e.ToolName}=>{e.Result.GetRawText()}"));
                 var reply = await session.SendAndWaitAsync(
-                    $"Summarize produce verification step concisely in Korean based on tool outputs: {toolSummary}",
+                    BuildMessageOptions($"Summarize produce verification step concisely in Korean based on tool outputs: {toolSummary}", envelope?.UpstreamAgent ?? plan.UpstreamAgent),
                     TimeSpan.FromSeconds(10),
                     cancellationToken);
                 if (!string.IsNullOrWhiteSpace(reply?.Data?.Content))
@@ -155,37 +209,40 @@ public sealed class CopilotSdkChatClientAdapter : IChatClient, IAsyncDisposable
         };
     }
 
-    private async Task<(ToolInvocationPlan Plan, bool ModelSelected)> ResolveToolPlanAsync(
+    private async Task<(ToolInvocationPlan Plan, bool ModelSelected, AgentHandoffEnvelope? Envelope)> ResolveToolPlanAsync(
         IReadOnlyList<ChatMessage> history,
+        string systemText,
         string userText,
         Dictionary<string, AIFunction> functions,
         CancellationToken cancellationToken)
     {
+        var envelope = TryParseHandoffEnvelope(userText);
         if (_modelToolPlanner is not null)
         {
             var planned = await _modelToolPlanner(history, functions, cancellationToken);
             if (planned is { Calls.Count: > 0 })
             {
                 ConnectionStatus = "CONNECTED_COPILOT_SDK_LIVE";
-                return (planned, true);
+                return (planned, true, envelope);
             }
         }
-        else if (!string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("GITHUB_TOKEN"))
-              || !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("COPILOT_GITHUB_TOKEN")))
+        else if (ResolveGitHubToken() is not null)
         {
             try
             {
-                await using var session = await _copilotClient.Value.CreateSessionAsync(new SessionConfig(), cancellationToken);
+                await using var session = await _copilotClient.Value.CreateSessionAsync(
+                    BuildSessionConfig(systemText, functions), cancellationToken);
                 var toolSchemas = functions.Values.Select(f => new { f.Name, f.Description, Schema = f.JsonSchema });
                 var prompt = $"Select bound tools to invoke as JSON {{\"calls\":[{{\"toolName\":\"...\",\"arguments\":{{...}}}}]}}. Available tools: {JsonSerializer.Serialize(toolSchemas, JsonOptions)}. Input: {userText}";
-                var reply = await session.SendAndWaitAsync(prompt, TimeSpan.FromSeconds(10), cancellationToken);
+                var reply = await session.SendAndWaitAsync(
+                    BuildMessageOptions(prompt, envelope?.UpstreamAgent), TimeSpan.FromSeconds(10), cancellationToken);
                 if (!string.IsNullOrWhiteSpace(reply?.Data?.Content))
                 {
                     var modelPlan = JsonSerializer.Deserialize<ToolInvocationPlan>(reply.Data.Content, JsonOptions);
                     if (modelPlan is { Calls.Count: > 0 } && modelPlan.Calls.All(c => functions.ContainsKey(c.ToolName)))
                     {
                         ConnectionStatus = "CONNECTED_COPILOT_SDK_LIVE";
-                        return (modelPlan, true);
+                        return (modelPlan, true, envelope);
                     }
                 }
             }
@@ -195,7 +252,132 @@ public sealed class CopilotSdkChatClientAdapter : IChatClient, IAsyncDisposable
             }
         }
 
-        return (ParsePlan(userText, functions), false);
+        if (envelope is not null)
+        {
+            return (PlanFromBoundAgentTools(envelope, functions), false, envelope);
+        }
+
+        return (ParsePlan(userText, functions), false, null);
+    }
+
+    private static AgentHandoffEnvelope? TryParseHandoffEnvelope(string text)
+    {
+        try
+        {
+            var json = JsonSerializer.Deserialize<JsonElement>(text);
+            if (json.ValueKind == JsonValueKind.Object
+                && json.TryGetProperty("objective", out _)
+                && json.TryGetProperty("state", out _))
+            {
+                return json.Deserialize<AgentHandoffEnvelope>(JsonOptions);
+            }
+        }
+        catch (JsonException)
+        {
+        }
+        return null;
+    }
+
+    private static ToolInvocationPlan PlanFromBoundAgentTools(
+        AgentHandoffEnvelope envelope,
+        Dictionary<string, AIFunction> functions)
+    {
+        var calls = new List<ToolInvocationRequest>();
+        var stateJson = JsonSerializer.SerializeToElement(envelope.State, JsonOptions);
+        var candidates = stateJson.TryGetProperty("candidates", out var candEl) && candEl.ValueKind == JsonValueKind.Array
+            ? candEl.Deserialize<List<EcommerceCandidate>>(JsonOptions)
+            : null;
+        var targetWeightKg = stateJson.TryGetProperty("targetWeightKg", out var wEl) && wEl.ValueKind == JsonValueKind.Number
+            ? wEl.GetDecimal()
+            : 0m;
+        var tickerCode = stateJson.TryGetProperty("tickerCode", out var tEl) && tEl.ValueKind == JsonValueKind.String
+            ? tEl.GetString()
+            : null;
+
+        foreach (var function in functions.Values)
+        {
+            var schema = function.JsonSchema;
+            if (!schema.TryGetProperty("properties", out var properties))
+            {
+                calls.Add(new ToolInvocationRequest(function.Name, new Dictionary<string, object?>()));
+                continue;
+            }
+
+            // Expand single-candidate evaluation tools across candidate arrays when present in state.
+            if (candidates is { Count: > 0 } && properties.TryGetProperty("listedPrice", out _) && properties.TryGetProperty("shippingFee", out _))
+            {
+                foreach (var candidate in candidates.Where(c => c.ListedWeightKg > 0 && c.ListedPrice >= 0 && c.ShippingFee >= 0))
+                {
+                    calls.Add(new ToolInvocationRequest(function.Name, new Dictionary<string, object?>
+                    {
+                        ["listedPrice"] = candidate.ListedPrice,
+                        ["shippingFee"] = candidate.ShippingFee,
+                        ["actualWeightKg"] = candidate.ListedWeightKg,
+                        ["targetWeightKg"] = targetWeightKg
+                    }));
+                }
+                continue;
+            }
+
+            if (candidates is { Count: > 0 } && properties.TryGetProperty("candidate", out _))
+            {
+                foreach (var candidate in candidates)
+                {
+                    calls.Add(new ToolInvocationRequest(function.Name, new Dictionary<string, object?>
+                    {
+                        ["tickerCode"] = tickerCode,
+                        ["candidate"] = candidate
+                    }));
+                }
+                continue;
+            }
+
+            var values = new Dictionary<string, object?>();
+            foreach (var prop in properties.EnumerateObject())
+            {
+                if (stateJson.TryGetProperty(prop.Name, out var val) && val.ValueKind != JsonValueKind.Null)
+                {
+                    values[prop.Name] = val;
+                }
+            }
+            calls.Add(new ToolInvocationRequest(function.Name, values));
+        }
+
+        return new ToolInvocationPlan(calls, envelope.UpstreamAgent, envelope.State);
+    }
+
+    private static Dictionary<string, object?> ResolveChainedArguments(
+        Dictionary<string, object?> initialArgs,
+        AIFunction function,
+        Dictionary<string, object?> dynamicState)
+    {
+        var resolved = new Dictionary<string, object?>(initialArgs);
+        if (!function.JsonSchema.TryGetProperty("properties", out var properties))
+        {
+            return resolved;
+        }
+        foreach (var prop in properties.EnumerateObject())
+        {
+            if ((!resolved.TryGetValue(prop.Name, out var existing) || existing is null)
+                && dynamicState.TryGetValue(prop.Name, out var chained)
+                && chained is not null)
+            {
+                resolved[prop.Name] = chained;
+            }
+        }
+        return resolved;
+    }
+
+    private static void MergeToolOutputIntoState(JsonElement output, Dictionary<string, object?> dynamicState)
+    {
+        if (output.ValueKind != JsonValueKind.Object) return;
+        foreach (var prop in output.EnumerateObject())
+        {
+            if (prop.Value.ValueKind != JsonValueKind.Null && prop.Value.ValueKind != JsonValueKind.Undefined)
+            {
+                dynamicState[prop.Name] = prop.Value;
+            }
+        }
     }
 
     private static ToolInvocationPlan ParsePlan(string text, Dictionary<string, AIFunction> functions)
@@ -310,27 +492,25 @@ public class CopilotAgentOrchestrator
             "상생 부등식, 100원 호가 단위, 미끼 필터링 불변식을 독립적으로 감사합니다.", tools.CreateAuditorTools());
     }
 
-    private static ToolInvocationRequest Call(string name, params (string Name, object? Value)[] arguments) =>
-        new(name, arguments.ToDictionary(argument => argument.Name, argument => argument.Value));
-
-    private static async Task<AgentToolBatchResult> RunToolsAsync(
-        ChatClientAgent agent, List<ToolInvocationRequest> calls, CancellationToken cancellationToken,
-        string? upstreamAgent = null, object? handoffContext = null)
+    private static async Task<AgentToolBatchResult> RunAgentStepAsync(
+        ChatClientAgent agent,
+        string upstreamAgent,
+        string objective,
+        Dictionary<string, object?> state,
+        CancellationToken cancellationToken)
     {
         using var activity = GamsdaqTelemetry.ActivitySource.StartActivity(agent.Name ?? "agent.step");
         activity?.SetTag("agent.name", agent.Name);
-        if (upstreamAgent is not null) activity?.SetTag("agent.upstream", upstreamAgent);
+        activity?.SetTag("agent.upstream", upstreamAgent);
         var started = Stopwatch.GetTimestamp();
         try
         {
-            var messages = new List<ChatMessage>();
-            if (upstreamAgent is not null && handoffContext is not null)
+            var envelope = new AgentHandoffEnvelope(upstreamAgent, agent.Name ?? "agent", objective, state);
+            var messages = new List<ChatMessage>
             {
-                messages.Add(new ChatMessage(ChatRole.System,
-                    JsonSerializer.Serialize(new { upstreamAgent, downstreamAgent = agent.Name, handoffContext }, CopilotSdkChatClientAdapter.JsonOptions)));
-            }
-            messages.Add(new ChatMessage(ChatRole.User,
-                JsonSerializer.Serialize(new ToolInvocationPlan(calls, upstreamAgent, handoffContext), CopilotSdkChatClientAdapter.JsonOptions)));
+                new(ChatRole.System, $"UpstreamAgent={upstreamAgent}; DownstreamAgent={agent.Name}; Objective={objective}"),
+                new(ChatRole.User, JsonSerializer.Serialize(envelope, CopilotSdkChatClientAdapter.JsonOptions))
+            };
             var response = await agent.RunAsync(messages, cancellationToken: cancellationToken);
             var text = response.Messages.Last(message => message.Role == ChatRole.Assistant).Text;
             return JsonSerializer.Deserialize<AgentToolBatchResult>(text, CopilotSdkChatClientAdapter.JsonOptions)
@@ -371,53 +551,95 @@ public class CopilotAgentOrchestrator
             yield break;
         }
 
-        var specExecution = await RunToolsAsync(_specNormalizerAgent, [
-            Call("parse_produce_spec", ("inputQuery", sanitizedQuery), ("tickerCode", request.TickerCode)),
-            Call("lookup_standard_ticker", ("tickerCode", request.TickerCode ?? (sanitizedQuery.Contains("반시") || sanitizedQuery.Contains("청도") ? "CD-BANSI-13B-5KG" : "JJ-GYUL-12B-3KG")))
-        ], cancellationToken, "PromptShieldGuardrail", new { sanitizedQuery, request.Role });
-        var spec = specExecution.Read<NormalizedSpecResult>("parse_produce_spec");
+        AgentToolBatchResult specExecution;
+        NormalizedSpecResult spec;
+        string? specRejectedReason = null;
+        try
+        {
+            specExecution = await RunAgentStepAsync(
+                _specNormalizerAgent,
+                upstreamAgent: "PromptShieldGuardrail",
+                objective: "사용자 입력에서 품목·당도·중량·수량을 정규화하고 표준 티커 규격을 조회한다.",
+                state: new Dictionary<string, object?>
+                {
+                    ["inputQuery"] = sanitizedQuery,
+                    ["tickerCode"] = request.TickerCode,
+                    ["role"] = request.Role
+                },
+                cancellationToken);
+            spec = specExecution.Read<NormalizedSpecResult>("parse_produce_spec");
+        }
+        catch (ArgumentException ex)
+        {
+            specRejectedReason = ex.Message;
+            specExecution = null!;
+            spec = null!;
+        }
+        if (specRejectedReason is not null)
+        {
+            yield return new AgentStreamEvent("STEP-1", _specNormalizerAgent.Name!, "SPEC_REJECTED", "parse_produce_spec",
+                specRejectedReason, null, DateTime.UtcNow);
+            yield break;
+        }
         yield return Event("STEP-1", _specNormalizerAgent, "COMPLETED",
             specExecution.CopilotReasoning ?? $"규격 정규화 완료: [{spec.TickerCode}] {spec.StandardName}", spec, specExecution);
 
-        var discovery = await RunToolsAsync(_priceDiscoveryAgent, [
-            Call("search_ecommerce_listings", ("tickerCode", spec.TickerCode)),
-            Call("fetch_wholesale_benchmark", ("tickerCode", spec.TickerCode))], cancellationToken,
-            _specNormalizerAgent.Name, spec);
+        var checkpoint = _tools.CaptureCheckpoint(spec.TickerCode);
+
+        var discovery = await RunAgentStepAsync(
+            _priceDiscoveryAgent,
+            upstreamAgent: _specNormalizerAgent.Name!,
+            objective: "표준 티커에 해당하는 온라인 소매 후보군(5건 이상)과 공영도매시장 기준가를 수집한다.",
+            state: new Dictionary<string, object?>
+            {
+                ["tickerCode"] = spec.TickerCode,
+                ["normalizedSpec"] = spec
+            },
+            cancellationToken);
         var listings = discovery.Read<List<EcommerceCandidate>>("search_ecommerce_listings");
         var wholesale = discovery.Read<WholesaleBenchmarkResult>("fetch_wholesale_benchmark");
         yield return Event("STEP-2", _priceDiscoveryAgent, "COMPLETED",
             discovery.CopilotReasoning ?? $"원본 소매 후보 {listings.Count}건, 산지 도매 기준가 {wholesale.WholesalePrice:N0}원 확보",
             new { wholesale, candidateCount = listings.Count }, discovery);
 
-        var baitCalls = new List<ToolInvocationRequest>();
-        foreach (var candidate in listings)
-        {
-            if (candidate.ListedWeightKg > 0 && candidate.ListedPrice >= 0 && candidate.ShippingFee >= 0)
+        var verification = await RunAgentStepAsync(
+            _baitVerifierAgent,
+            upstreamAgent: _priceDiscoveryAgent.Name!,
+            objective: "모든 소매 후보의 실질 환산가를 계산하고 4-Gate 미끼 필터링을 수행해 실질 최저가를 확정한다.",
+            state: new Dictionary<string, object?>
             {
-                baitCalls.Add(Call("calculate_effective_price", ("listedPrice", candidate.ListedPrice),
-                    ("shippingFee", candidate.ShippingFee), ("actualWeightKg", candidate.ListedWeightKg), ("targetWeightKg", spec.WeightKg)));
-            }
-            baitCalls.Add(Call("evaluate_bait_rules", ("tickerCode", spec.TickerCode), ("candidate", candidate)));
-        }
-        baitCalls.Add(Call("verify_four_gate_lowest_price", ("tickerCode", spec.TickerCode), ("candidates", listings)));
-        var verification = await RunToolsAsync(_baitVerifierAgent, baitCalls, cancellationToken,
-            _priceDiscoveryAgent.Name, new { spec, wholesale, candidateCount = listings.Count });
+                ["tickerCode"] = spec.TickerCode,
+                ["targetWeightKg"] = spec.WeightKg,
+                ["candidates"] = listings,
+                ["wholesalePrice"] = wholesale.WholesalePrice
+            },
+            cancellationToken);
         var baitSummary = verification.Read<BaitVerificationSummary>("verify_four_gate_lowest_price");
         yield return Event("STEP-3", _baitVerifierAgent, "COMPLETED",
             verification.CopilotReasoning ?? $"4-Gate 검증: {baitSummary.RejectedBaitCount}건 제외, 실질 최저가 {baitSummary.VerifiedRetailLowestPrice:N0}원 채택",
             baitSummary, verification);
 
-        async Task<AgentToolBatchResult> QuoteAsync(bool retry) => await RunToolsAsync(_optimalQuoteAgent, [
-            Call("get_order_book_snapshot", ("tickerCode", spec.TickerCode)),
-            Call("compute_win_win_optimal_quote", ("tickerCode", spec.TickerCode),
-                ("minimumPrice", retry ? wholesale.WholesalePrice + 500 : null),
-                ("maximumPrice", retry ? baitSummary.VerifiedRetailLowestPrice - 500 : null))], cancellationToken,
-            _baitVerifierAgent.Name, new { wholesale.WholesalePrice, baitSummary.VerifiedRetailLowestPrice, retry });
+        async Task<AgentToolBatchResult> QuoteAsync(bool retry) => await RunAgentStepAsync(
+            _optimalQuoteAgent,
+            upstreamAgent: _baitVerifierAgent.Name!,
+            objective: "현재 호가창 잔량(OBI)을 조회하고 상생 가격 밴드 내 최적 추천 호가와 즉시체결 호가를 계산한다.",
+            state: new Dictionary<string, object?>
+            {
+                ["tickerCode"] = spec.TickerCode,
+                ["minimumPrice"] = retry ? (int?)(wholesale.WholesalePrice + 500) : null,
+                ["maximumPrice"] = retry ? (int?)(baitSummary.VerifiedRetailLowestPrice - 500) : null,
+                ["wholesalePrice"] = wholesale.WholesalePrice,
+                ["verifiedRetailLowestPrice"] = baitSummary.VerifiedRetailLowestPrice
+            },
+            cancellationToken);
 
         var quoteExecution = await QuoteAsync(false);
         var optimalQuote = quoteExecution.Read<OptimalQuoteResult>("compute_win_win_optimal_quote");
+        var immediateInfo = optimalQuote.ImmediateMatchAskPrice.HasValue || optimalQuote.ImmediateMatchBidPrice.HasValue
+            ? $" [즉시체결 매수 {optimalQuote.ImmediateMatchAskPrice ?? optimalQuote.RecommendedOptimalPrice:N0}원 / 매도 {optimalQuote.ImmediateMatchBidPrice ?? optimalQuote.RecommendedOptimalPrice:N0}원]"
+            : "";
         yield return Event("STEP-4", _optimalQuoteAgent, "COMPLETED",
-            quoteExecution.CopilotReasoning ?? $"상생 최적 호가 {optimalQuote.RecommendedOptimalPrice:N0}원 (농부 +{optimalQuote.FarmerExtraGainAmount:N0}원 / 소비자 -{optimalQuote.ConsumerSavedAmount:N0}원)",
+            quoteExecution.CopilotReasoning ?? $"상생 최적 대기호가 {optimalQuote.RecommendedOptimalPrice:N0}원 (농부 +{optimalQuote.FarmerExtraGainAmount:N0}원 / 소비자 -{optimalQuote.ConsumerSavedAmount:N0}원){immediateInfo}",
             optimalQuote, quoteExecution);
 
         var adoptedCandidate = baitSummary.Candidates.FirstOrDefault(c => c.IsPassed && c.Effective3KgOr5KgPrice == baitSummary.VerifiedRetailLowestPrice)
@@ -426,18 +648,24 @@ public class CopilotAgentOrchestrator
             && adoptedCandidate is not null
             && !string.IsNullOrWhiteSpace(adoptedCandidate.SourceUrl);
 
-        async Task<AgentToolBatchResult> AuditAsync() => await RunToolsAsync(_auditorGuardrailAgent, [
-            Call("audit_quote_invariants", ("wholesalePrice", wholesale.WholesalePrice),
-                ("optimalPrice", optimalQuote.RecommendedOptimalPrice),
-                ("retailLowestPrice", baitSummary.VerifiedRetailLowestPrice),
-                ("rejectedBaitCount", baitSummary.RejectedBaitCount),
-                ("adoptedBrix", adoptedCandidate?.GuaranteedBrix),
-                ("targetMinBrix", spec.MinBrix),
-                ("adoptedGrade", adoptedCandidate?.GradeText),
-                ("targetGrade", spec.Grade),
-                ("hasSourceProvenance", hasSourceProvenance),
-                ("adoptedSourceUrl", adoptedCandidate?.SourceUrl))], cancellationToken,
-            _optimalQuoteAgent.Name, new { optimalQuote, adoptedCandidate, wholesaleSourceUrl = wholesale.SourceUrl });
+        async Task<AgentToolBatchResult> AuditAsync() => await RunAgentStepAsync(
+            _auditorGuardrailAgent,
+            upstreamAgent: _optimalQuoteAgent.Name!,
+            objective: "상생 가격 부등식, 100원 호가 단위, 미끼 필터링, 스펙 일치 및 출처 불변식을 교차 감사한다.",
+            state: new Dictionary<string, object?>
+            {
+                ["wholesalePrice"] = wholesale.WholesalePrice,
+                ["optimalPrice"] = optimalQuote.RecommendedOptimalPrice,
+                ["retailLowestPrice"] = baitSummary.VerifiedRetailLowestPrice,
+                ["rejectedBaitCount"] = baitSummary.RejectedBaitCount,
+                ["adoptedBrix"] = adoptedCandidate?.GuaranteedBrix,
+                ["targetMinBrix"] = spec.MinBrix,
+                ["adoptedGrade"] = adoptedCandidate?.GradeText,
+                ["targetGrade"] = spec.Grade,
+                ["hasSourceProvenance"] = hasSourceProvenance,
+                ["adoptedSourceUrl"] = adoptedCandidate?.SourceUrl
+            },
+            cancellationToken);
 
         const int maxRetries = 2;
         var auditExecution = await AuditAsync();
@@ -454,11 +682,22 @@ public class CopilotAgentOrchestrator
             audit = auditExecution.Read<AuditResult>("audit_quote_invariants");
         }
 
+        if (!audit.AuditPassed)
+        {
+            _tools.RestoreCheckpoint(spec.TickerCode, checkpoint);
+            optimalQuote = optimalQuote with { RecommendedOptimalPrice = 0 };
+        }
+
         yield return Event("STEP-5", _auditorGuardrailAgent, audit.AuditPassed ? "AUDIT_PASSED" : "AUDIT_FAILED",
             audit.AuditVerdict, new { spec, baitVerification = baitSummary, optimalQuote, audit }, auditExecution);
     }
 
-    public NaturalSellerQuoteResponse AnalyzeNaturalSellerInput(string rawInput)
+    public NaturalSellerQuoteResponse AnalyzeNaturalSellerInput(string rawInput) =>
+        AnalyzeNaturalSellerInputAsync(rawInput).GetAwaiter().GetResult();
+
+    public async Task<NaturalSellerQuoteResponse> AnalyzeNaturalSellerInputAsync(
+        string rawInput,
+        CancellationToken cancellationToken = default)
     {
         var started = Stopwatch.GetTimestamp();
         var (safe, sanitized, warning) = PromptShieldGuardrail.ValidateAndSanitize(rawInput);
@@ -466,17 +705,42 @@ public class CopilotAgentOrchestrator
         {
             return new NaturalSellerQuoteResponse(false, warning, "JJ-GYUL-12B-3KG", "12브릭스 노지 감귤 3kg",
                 0, 0, 0, 0, 0, 0, warning ?? "입력 차단",
-                Math.Round(Stopwatch.GetElapsedTime(started).TotalMilliseconds, 2), 3);
+                Math.Round(Stopwatch.GetElapsedTime(started).TotalMilliseconds, 2), 3, 0);
         }
-        var spec = _tools.ParseProduceSpecTool(sanitized);
-        _tools.VerifyFourGateLowestPriceTool(spec.TickerCode);
-        var quote = _tools.ComputeWinWinOptimalQuoteTool(spec.TickerCode);
-        int totalExtra = quote.FarmerExtraGainAmount * spec.ExtractedQuantity;
+
+        NormalizedSpecResult? spec = null;
+        OptimalQuoteResult? quote = null;
+        AuditResult? audit = null;
+        int executedSteps = 0;
+
+        await foreach (var evt in RunVerificationStreamAsync(new AgentVerifyRequest(sanitized, "SELLER"), cancellationToken))
+        {
+            executedSteps++;
+            if (evt.StepId == "STEP-1" && evt.Payload is NormalizedSpecResult s) spec = s;
+            if (evt.StepId == "STEP-4" && evt.Payload is OptimalQuoteResult q) quote = q;
+            if (evt.StepId == "STEP-5" && evt.Status is "AUDIT_PASSED" or "AUDIT_FAILED")
+            {
+                var json = JsonSerializer.SerializeToElement(evt.Payload, CopilotSdkChatClientAdapter.JsonOptions);
+                if (json.TryGetProperty("audit", out var auditEl))
+                {
+                    audit = auditEl.Deserialize<AuditResult>(CopilotSdkChatClientAdapter.JsonOptions);
+                }
+            }
+        }
+
         double elapsedMs = Math.Round(Stopwatch.GetElapsedTime(started).TotalMilliseconds, 2);
+        if (spec is null || quote is null || audit is not { AuditPassed: true })
+        {
+            return new NaturalSellerQuoteResponse(false, audit?.AuditVerdict ?? "감사 검증 실패",
+                spec?.TickerCode ?? "JJ-GYUL-12B-3KG", spec?.StandardName ?? "12브릭스 노지 감귤 3kg",
+                0, 0, 0, 0, 0, 0, audit?.AuditVerdict ?? "감사 검증 실패", elapsedMs, 3, executedSteps);
+        }
+
+        int totalExtra = quote.FarmerExtraGainAmount * spec.ExtractedQuantity;
         return new NaturalSellerQuoteResponse(true, null, spec.TickerCode, spec.StandardName, spec.ExtractedQuantity,
             quote.WholesaleFloorPrice, quote.VerifiedRetailCeilingPrice, quote.RecommendedOptimalPrice,
             quote.FarmerExtraGainAmount, totalExtra,
             $"도매가 대비 박스당 +{quote.FarmerExtraGainAmount:N0}원, {spec.ExtractedQuantity}박스 총 +{totalExtra:N0}원 추가 수익을 기대합니다.",
-            elapsedMs, 3);
+            elapsedMs, 3, executedSteps);
     }
 }

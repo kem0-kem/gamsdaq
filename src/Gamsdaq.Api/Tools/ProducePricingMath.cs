@@ -80,7 +80,7 @@ public static class ProducePricingMath
             : $"통과: 배송비 {candidate.ShippingFee:N0}원 합산, {ticker.WeightKg}kg 실질 환산가 {effective:N0}원";
         if (shippingWarning)
         {
-            reason += "; 배송비 주의 (상품가의 35% 초과)";
+            reason += "; [FLAG_SHIPPING_BAIT] 배송비 주의 (상품가의 35% 초과)";
         }
 
         return candidate with
@@ -133,10 +133,21 @@ public static class ProducePricingMath
         int clampedOpt = Math.Clamp(RoundToTick(Math.Clamp(raw, lower, upper), 100), lowerTick, upperTick);
         int saved = ticker.VerifiedRetailLowestPrice - clampedOpt;
         int gain = clampedOpt - ticker.WholesalePrice;
+        int? bestAsk = snapshot.Asks
+            .Where(a => a.Price > ticker.WholesalePrice && a.Price < ticker.VerifiedRetailLowestPrice && a.Quantity > 0)
+            .OrderBy(a => a.Price)
+            .Select(a => (int?)a.Price)
+            .FirstOrDefault();
+        int? bestBid = snapshot.Bids
+            .Where(b => b.Price > ticker.WholesalePrice && b.Price < ticker.VerifiedRetailLowestPrice && b.Quantity > 0)
+            .OrderByDescending(b => b.Price)
+            .Select(b => (int?)b.Price)
+            .FirstOrDefault();
 
         return new OptimalQuoteResult(ticker.Code, ticker.WholesalePrice, ticker.VerifiedRetailLowestPrice,
             clampedOpt, (double)obi, saved,
             (double)Math.Round((decimal)saved / ticker.VerifiedRetailLowestPrice * 100m, 1),
-            gain, (double)Math.Round((decimal)gain / ticker.WholesalePrice * 100m, 1));
+            gain, (double)Math.Round((decimal)gain / ticker.WholesalePrice * 100m, 1),
+            bestAsk, bestBid, clampedOpt);
     }
 }

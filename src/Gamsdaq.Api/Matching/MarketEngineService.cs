@@ -358,6 +358,28 @@ public class MarketEngineService
         }
     }
 
+    public (ProduceTicker Ticker, List<EcommerceCandidate> VerifiedCandidates) CaptureVerificationCheckpoint(string code)
+    {
+        lock (_sync)
+        {
+            var ticker = GetTicker(code);
+            var verified = _verifiedCandidates.GetValueOrDefault(ticker.Code)?.ToList() ?? [];
+            return (ticker, verified);
+        }
+    }
+
+    public void RestoreVerificationCheckpoint(
+        string code,
+        (ProduceTicker Ticker, List<EcommerceCandidate> VerifiedCandidates) checkpoint)
+    {
+        lock (_sync)
+        {
+            var ticker = GetTicker(code);
+            _tickers[ticker.Code] = checkpoint.Ticker;
+            _verifiedCandidates[ticker.Code] = checkpoint.VerifiedCandidates.ToList();
+        }
+    }
+
     public OptimalQuoteResult RecomputeOptimalQuote(string tickerCode, int? minimumPrice = null, int? maximumPrice = null)
     {
         lock (_sync)

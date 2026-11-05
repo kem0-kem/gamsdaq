@@ -46,6 +46,7 @@ interface EcommerceCandidate {
   gateCode: string
   verdictReason: string
   sourceUrl: string
+  collectedAtKst?: string
 }
 
 interface OrderBookSnapshot {
@@ -89,6 +90,8 @@ interface AgentStreamEvent {
   status: string
   toolName: string | null
   summary: string
+  executionLatencyMs?: number | null
+  executionMode?: string | null
 }
 
 const state = {
@@ -450,6 +453,7 @@ function renderAiAuditView(ob: OrderBookSnapshot): string {
               <td style="font-weight:700">
                 <div>${escapeHtml(c.mallName)}</div>
                 <div style="font-size:10px;color:#666666;font-weight:500">${escapeHtml(c.sourceUrl)}</div>
+                <div style="font-size:10px;color:#666666;font-weight:500">기준시각: ${escapeHtml(c.collectedAtKst ?? '2026-11-05 14:00 KST')}</div>
               </td>
               <td>${escapeHtml(c.productTitle)} (${c.listedWeightKg}kg | ${escapeHtml(c.gradeText)})</td>
               <td>${fmtWon(c.listedPrice)} + ${fmtWon(c.shippingFee)}</td>
@@ -468,8 +472,15 @@ function renderAiAuditView(ob: OrderBookSnapshot): string {
           ? `<div style="color:#666666">상단 [5-에이전트 실시간 재검증 실행] 버튼을 누르면 5개 에이전트의 도구 호출 및 Maker-Checker 감사 로그가 실시간 스트리밍됩니다.</div>`
           : state.agentSteps.map(s => `
             <div class="agent-step">
-              <div><b>[${escapeHtml(s.stepId)} | ${escapeHtml(s.agentName)}]</b> ${escapeHtml(s.summary)}</div>
-              <div style="color:#666666;white-space:nowrap">${escapeHtml(s.status)}</div>
+              <div>
+                <b>[${escapeHtml(s.stepId)} | ${escapeHtml(s.agentName)}]</b>
+                <span style="font-size:11px;color:#1B64DA;font-weight:700;margin-left:6px">도구: ${escapeHtml(s.toolName ?? '-')}</span>
+                <div style="margin-top:2px">${escapeHtml(s.summary)}</div>
+              </div>
+              <div style="color:#666666;white-space:nowrap;text-align:right">
+                <div style="font-weight:700">${escapeHtml(s.status)}</div>
+                <div style="font-size:10px">${escapeHtml(s.executionMode ?? 'DETERMINISTIC_AIFUNCTION')}${s.executionLatencyMs != null ? ` · ${s.executionLatencyMs.toFixed(1)}ms` : ''}</div>
+              </div>
             </div>
           `).join('')}
       </div>

@@ -907,12 +907,17 @@ public class GamsdaqEngineTests
     [Fact]
     public async Task AgentPipeline_StopsAfterTwoRetriesAndNeverLabelsFailedAuditAsPassed()
     {
-        var tools = new RetryQuoteTools(new MarketEngineService(), true);
+        var engine = new MarketEngineService();
+        int initialOptimal = engine.GetTicker(Gyul).AiOptimalPrice;
+        var tools = new RetryQuoteTools(engine, true);
         var events = await RunPipeline(tools);
         Assert.Equal(2, events.Count(item => item.Status == "AUDIT_RETRY"));
         Assert.Equal(3, tools.QuoteCalls);
         Assert.Equal("AUDIT_FAILED", events[^1].Status);
         Assert.DoesNotContain(events, item => item.Status == "AUDIT_PASSED");
+        Assert.Equal(initialOptimal, engine.GetTicker(Gyul).AiOptimalPrice);
+        var failedPayload = JsonSerializer.SerializeToElement(events[^1].Payload);
+        Assert.Equal(0, failedPayload.GetProperty("optimalQuote").GetProperty("RecommendedOptimalPrice").GetInt32());
     }
 
     private sealed class RetryQuoteTools(MarketEngineService market, bool alwaysInvalid) : GamsdaqTools(market)
@@ -969,5 +974,64 @@ public class GamsdaqEngineTests
         Assert.Contains("gamsdaq.agent.step.duration", measurements);
         Assert.Contains("gamsdaq.bait.rejection.rate", measurements);
         Assert.Contains("gamsdaq.order.matching.duration", measurements);
+    }
+
+    [Fact]
+    public void CopilotSdkAdapter_BuildsNativeSessionConfigWithToolsAllowlistAndAgentMessageSource()
+    {
+        var tools = new GamsdaqTools(new MarketEngineService())
+            .CreateSpecNormalizerTools()
+            .OfType<AIFunction>()
+            .ToDictionary(f => f.Name);
+        var sessionConfig = CopilotSdkChatClientAdapter.BuildSessionConfig("규격 정규화 지침", tools, "gpt-5");
+        Assert.Equal("gpt-5", sessionConfig.Model);
+        Assert.NotNull(sessionConfig.Tools);
+        Assert.Equal(2, sessionConfig.Tools.Count);
+        Assert.NotNull(sessionConfig.AvailableTools);
+        Assert.Contains("parse_produce_spec", sessionConfig.AvailableTools);
+        Assert.Contains("lookup_standard_ticker", sessionConfig.AvailableTools);
+        Assert.NotNull(sessionConfig.SystemMessage);
+        Assert.Contains("규격 정규화 지침", sessionConfig.SystemMessage.Content);
+
+        var msgOptions = CopilotSdkChatClientAdapter.BuildMessageOptions("handoff payload", "SpecNormalizerAgent");
+        Assert.Equal("handoff payload", msgOptions.Prompt);
+        Assert.NotNull(msgOptions.Source);
+    }
+
+    [Fact]
+    public async Task NaturalSellerQuote_RunsFullFiveAgentPipelineAndSeparatesExtractedFromDefaultFields()
+    {
+        var tools = new GamsdaqTools(new MarketEngineService());
+        var parsed = tools.ParseProduceSpecTool("청도 반시 다섯 키로 다섯 상자");
+        Assert.Equal(Bansi, parsed.TickerCode);
+        Assert.Equal(5, parsed.ExtractedQuantity);
+        Assert.Contains("crop", parsed.ExtractedFields!);
+        Assert.Contains("origin", parsed.ExtractedFields!);
+        Assert.Contains("weightKg", parsed.ExtractedFields!);
+        Assert.Contains("quantity", parsed.ExtractedFields!);
+        Assert.Contains("minBrix", parsed.DefaultMappedFields!);
+        Assert.Contains("grade", parsed.DefaultMappedFields!);
+
+        using var adapter = new CopilotSdkChatClientAdapter(NullLogger<CopilotSdkChatClientAdapter>.Instance);
+        var orchestrator = new CopilotAgentOrchestrator(adapter, tools, NullLoggerFactory.Instance);
+        var sellerQuote = await orchestrator.AnalyzeNaturalSellerInputAsync("청도 명품 반시 대과 5kg 스무 상자");
+        Assert.True(sellerQuote.IsSafeInput);
+        Assert.Equal(Bansi, sellerQuote.MatchedTickerCode);
+        Assert.Equal(20, sellerQuote.ExtractedQuantity);
+        Assert.Equal(3, sellerQuote.ClicksEquivalent);
+        Assert.Equal(5, sellerQuote.ExecutedAgentsCount);
+    }
+
+    [Theory]
+    [InlineData("10브릭스 노지 감귤 3kg 10박스")]
+    [InlineData("12브릭스 노지 감귤 1kg 10박스")]
+    [InlineData("파지 노지 감귤 3kg 10박스")]
+    [InlineData("청도 명품 반시 대과 세 키로 10박스")]
+    public async Task SpecNormalizer_RejectsSubstandardBrixMismatchedWeightAndForbiddenGrade(string invalidInput)
+    {
+        var tools = new GamsdaqTools(new MarketEngineService());
+        Assert.Throws<ArgumentException>(() => tools.ParseProduceSpecTool(invalidInput));
+        var events = await RunPipeline(tools, invalidInput, Gyul);
+        Assert.Equal("SPEC_REJECTED", Assert.Single(events).Status);
     }
 }
